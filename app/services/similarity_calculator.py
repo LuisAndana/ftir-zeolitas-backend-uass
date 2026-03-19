@@ -1,10 +1,12 @@
 """
-Calculador de similitud espectral FTIR
+Calculador de similitud espectral FTIR - VERSIÓN MEJORADA 2024
 Implementa algoritmos de comparación: coseno, Pearson, euclidea
+Con logging detallado y validación robusta de datos
 """
 
 import json
 import math
+import numpy as np
 from typing import Optional, List, Dict
 import logging
 
@@ -16,6 +18,7 @@ class SimilarityCalculator:
 
     def __init__(self):
         self.tolerance = 4  # Tolerancia en cm⁻¹
+        self.peak_threshold = 0.01  # Umbral para detección de picos (REDUCIDO)
 
     # ====================================================
     # ALGORITMOS DE SIMILITUD
@@ -91,6 +94,7 @@ class SimilarityCalculator:
     def parse_wavenumber_data(wavenumber_data) -> tuple:
         """
         Parsear datos de wavenumber desde JSON o dict
+        ✅ MEJORADO: Soporta ambos formatos (wavenumbers + intensities)
         Retorna: (wavenumbers, absorbance)
         """
         try:
@@ -99,12 +103,24 @@ class SimilarityCalculator:
             else:
                 data = wavenumber_data
 
+            # ✅ Soportar ambos formatos
             wavenumbers = data.get("wavenumbers", [])
             absorbance = data.get("absorbance", [])
 
+            # Si no hay wavenumbers, intentar con intensities (formato dataset)
+            if not wavenumbers and "intensities" in data:
+                intensities = data.get("intensities", [])
+                if intensities:
+                    logger.debug("⚠️ Usando formato 'intensities' en lugar de 'wavenumbers'")
+                    return list(range(len(intensities))), intensities
+
+            if not wavenumbers or not absorbance:
+                logger.warning(f"⚠️ Datos incompletos: wavenumbers={len(wavenumbers)}, absorbance={len(absorbance)}")
+                return [], []
+
             return wavenumbers, absorbance
         except Exception as e:
-            logger.error(f"Error parseando wavenumber_data: {e}")
+            logger.error(f"❌ Error parseando wavenumber_data: {e}")
             return [], []
 
     @staticmethod
@@ -117,6 +133,7 @@ class SimilarityCalculator:
         indices = [i for i, w in enumerate(wavenumbers) if range_min <= w <= range_max]
 
         if not indices:
+            logger.warning(f"⚠️ Sin datos en rango {range_min}-{range_max}")
             return [], []
 
         filtered_wn = [wavenumbers[i] for i in indices]
@@ -129,54 +146,99 @@ class SimilarityCalculator:
                      wn2: List[float], abs2: List[float],
                      tolerance: float) -> tuple:
         """
-        Alinear dos espectros usando nearest-neighbor con tolerancia
+        ✅ MEJORADO: Alineación más robusta usando numpy
         Retorna: (aligned_abs1, aligned_abs2)
         """
-        aligned1 = []
-        aligned2 = []
+        if not wn1 or not abs1 or not wn2 or not abs2:
+            return [], []
 
-        for target_wn, target_abs in zip(wn1, abs1):
-            best_idx = -1
-            best_dist = float('inf')
+        try:
+            # Convertir a numpy para eficiencia
+            wn1_arr = np.array(wn1, dtype=float)
+            abs1_arr = np.array(abs1, dtype=float)
+            wn2_arr = np.array(wn2, dtype=float)
+            abs2_arr = np.array(abs2, dtype=float)
 
-            for j, ref_wn in enumerate(wn2):
-                dist = abs(ref_wn - target_wn)
-                if dist < best_dist and dist <= tolerance:
-                    best_dist = dist
-                    best_idx = j
+            aligned1 = []
+            aligned2 = []
 
-            if best_idx >= 0:
-                aligned1.append(target_abs)
-                aligned2.append(abs2[best_idx])
+            # Usar el espectro más denso como referencia
+            if len(wn1) >= len(wn2):
+                ref_wn, ref_abs = wn1_arr, abs1_arr
+                query_wn, query_abs = wn2_arr, abs2_arr
+                swap = False
+            else:
+                ref_wn, ref_abs = wn2_arr, abs2_arr
+                query_wn, query_abs = wn1_arr, abs1_arr
+                swap = True
 
-        return aligned1, aligned2
+            # Alineación por nearest neighbor
+            for i, target_wn in enumerate(ref_wn):
+                distances = np.abs(query_wn - target_wn)
+                min_idx = np.argmin(distances)
+                min_dist = distances[min_idx]
+
+                # Solo alinear si está dentro de tolerancia
+                if min_dist <= tolerance:
+                    if swap:
+                        aligned1.append(float(query_abs[min_idx]))
+                        aligned2.append(float(ref_abs[i]))
+                    else:
+                        aligned1.append(float(ref_abs[i]))
+                        aligned2.append(float(query_abs[min_idx]))
+
+            logger.debug(f"🔗 Puntos alineados: {len(aligned1)}")
+            return aligned1, aligned2
+
+        except Exception as e:
+            logger.error(f"❌ Error en alineación: {e}")
+            return [], []
 
     @staticmethod
     def detect_peaks(wavenumbers: List[float], absorbance: List[float],
-                    threshold: float = 0.05) -> List[float]:
+                    threshold: float = 0.01) -> List[float]:
         """
-        Detectar picos (máximos locales) en un espectro
-        Retorna lista de wavenumbers de los picos
+        ✅ MEJORADO: Detección con normalización automática
+        Threshold REDUCIDO de 0.05 a 0.01 (configurable)
         """
         if len(absorbance) < 3:
+            logger.debug(f"⚠️ Espectro muy corto: {len(absorbance)} puntos")
             return []
 
-        peaks = []
+        try:
+            # ✅ Normalizar absorbance a 0-1
+            abs_arr = np.array(absorbance, dtype=float)
+            max_abs = np.max(abs_arr)
+            min_abs = np.min(abs_arr)
 
-        for i in range(1, len(absorbance) - 1):
-            if (absorbance[i] > absorbance[i-1] and
-                absorbance[i] > absorbance[i+1] and
-                absorbance[i] > threshold):
-                peaks.append(wavenumbers[i])
+            if max_abs == min_abs:
+                logger.debug("⚠️ Todos los valores de absorbance son iguales")
+                return []
 
-        return peaks
+            # Normalizar a rango 0-1
+            norm_abs = (abs_arr - min_abs) / (max_abs - min_abs)
+
+            peaks = []
+
+            for i in range(1, len(norm_abs) - 1):
+                # Detección de máximos locales
+                if (norm_abs[i] > norm_abs[i-1] and
+                    norm_abs[i] > norm_abs[i+1] and
+                    norm_abs[i] > threshold):
+                    peaks.append(wavenumbers[i])
+
+            logger.debug(f"🎯 Picos detectados: {len(peaks)}")
+            return peaks
+
+        except Exception as e:
+            logger.error(f"❌ Error detectando picos: {e}")
+            return []
 
     @staticmethod
     def match_peaks(peaks1: List[float], peaks2: List[float],
                    tolerance: float) -> Dict:
         """
         Emparejar picos entre dos espectros con tolerancia
-        Retorna dict con: matched, unmatched, total
         """
         matched = []
         unmatched = []
@@ -195,7 +257,8 @@ class SimilarityCalculator:
         return {
             "matched": matched,
             "unmatched": unmatched,
-            "total": len(peaks1)
+            "total": len(peaks1),
+            "matched_count": len(matched)
         }
 
     # ====================================================
@@ -204,46 +267,57 @@ class SimilarityCalculator:
 
     def calculate_similarity(self, spectrum1, spectrum2, method: str = "cosine",
                             tolerance: float = 4, range_min: int = 400,
-                            range_max: int = 4000) -> Optional[Dict]:
+                            range_max: int = 4000, peak_threshold: float = None) -> Optional[Dict]:
         """
-        Calcular similitud entre dos espectros
-
-        Args:
-            spectrum1: Objeto Spectrum (query)
-            spectrum2: Objeto Spectrum (referencia)
-            method: "cosine", "pearson", o "euclidean"
-            tolerance: Tolerancia en cm⁻¹ para alineación
-            range_min: Rango mínimo de wavenumber
-            range_max: Rango máximo de wavenumber
-
-        Returns:
-            Dict con similitud global, window_scores, matched_peaks, etc.
+        ✅ VERSIÓN MEJORADA CON LOGGING DETALLADO EN 6 FASES
+        Calcula similitud entre dos espectros
         """
+        if peak_threshold is None:
+            peak_threshold = self.peak_threshold
+
         try:
-            # Parsear datos
+            logger.info("="*70)
+            logger.info(f"📊 INICIANDO CÁLCULO DE SIMILITUD")
+            logger.info(f"   Spectrum1: {spectrum1.id}")
+            logger.info(f"   Spectrum2: {spectrum2.id}")
+            logger.info(f"   Método: {method}, Tolerancia: {tolerance}")
+            logger.info("="*70)
+
+            # 1️⃣ PARSEAR DATOS
             wn1, abs1 = self.parse_wavenumber_data(spectrum1.wavenumber_data)
             wn2, abs2 = self.parse_wavenumber_data(spectrum2.wavenumber_data)
 
+            logger.info(f"1️⃣ PARSEO:")
+            logger.info(f"   Spectrum1: {len(wn1)} wavenumbers, {len(abs1)} absorbance")
+            logger.info(f"   Spectrum2: {len(wn2)} wavenumbers, {len(abs2)} absorbance")
+
             if not wn1 or not abs1 or not wn2 or not abs2:
-                logger.warning(f"Espectro sin datos: {spectrum1.id} o {spectrum2.id}")
+                logger.error(f"❌ FALLÓ: Datos incompletos en parseo")
                 return None
 
-            # Filtrar por rango
+            # 2️⃣ FILTRAR POR RANGO
             wn1, abs1 = self.filter_by_range(wn1, abs1, range_min, range_max)
             wn2, abs2 = self.filter_by_range(wn2, abs2, range_min, range_max)
 
+            logger.info(f"2️⃣ FILTRADO (rango {range_min}-{range_max}):")
+            logger.info(f"   Spectrum1: {len(wn1)} puntos")
+            logger.info(f"   Spectrum2: {len(wn2)} puntos")
+
             if not wn1 or not wn2:
-                logger.warning(f"Datos vacíos después de filtrar rango")
+                logger.error(f"❌ FALLÓ: Datos vacíos después de filtrar")
                 return None
 
-            # Alinear espectros
+            # 3️⃣ ALINEAR ESPECTROS
             aligned1, aligned2 = self.align_spectra(wn1, abs1, wn2, abs2, tolerance)
 
+            logger.info(f"3️⃣ ALINEAMIENTO (tolerancia {tolerance} cm⁻¹):")
+            logger.info(f"   Puntos alineados: {len(aligned1)}")
+
             if not aligned1 or not aligned2:
-                logger.warning(f"No se pudieron alinear espectros")
+                logger.error(f"❌ FALLÓ: No se alinearon espectros")
                 return None
 
-            # Calcular similitud según método
+            # 4️⃣ CALCULAR SIMILITUD
             if method == "cosine":
                 score = self.cosine_similarity(aligned1, aligned2)
             elif method == "pearson":
@@ -253,13 +327,28 @@ class SimilarityCalculator:
             else:
                 score = self.cosine_similarity(aligned1, aligned2)
 
-            # Detectar picos
-            peaks1 = self.detect_peaks(wn1, abs1)
-            peaks2 = self.detect_peaks(wn2, abs2)
+            logger.info(f"4️⃣ CÁLCULO DE SIMILITUD:")
+            logger.info(f"   Score ({method}): {score:.4f} ({score*100:.2f}%)")
+
+            # 5️⃣ DETECTAR PICOS
+            peaks1 = self.detect_peaks(wn1, abs1, threshold=peak_threshold)
+            peaks2 = self.detect_peaks(wn2, abs2, threshold=peak_threshold)
+
+            logger.info(f"5️⃣ DETECCIÓN DE PICOS (threshold {peak_threshold}):")
+            logger.info(f"   Spectrum1 picos: {len(peaks1)}")
+            logger.info(f"   Spectrum2 picos: {len(peaks2)}")
+
+            # 6️⃣ EMPAREJAR PICOS
             peak_match = self.match_peaks(peaks1, peaks2, tolerance)
 
+            logger.info(f"6️⃣ EMPAREJAMIENTO DE PICOS:")
+            logger.info(f"   Coincidencias: {peak_match['matched_count']}/{len(peaks1)}")
+            logger.info("="*70)
+            logger.info(f"✅ CÁLCULO COMPLETADO EXITOSAMENTE")
+            logger.info("="*70)
+
             return {
-                "global_score": max(0, min(1, score)),  # Asegurar rango 0-1
+                "global_score": max(0, min(1, score)),
                 "window_scores": [],
                 "matching_peaks": len(peak_match["matched"]),
                 "total_peaks": peak_match["total"],
@@ -268,5 +357,5 @@ class SimilarityCalculator:
             }
 
         except Exception as e:
-            logger.error(f"Error calculando similitud: {e}")
+            logger.error(f"❌ EXCEPCIÓN: {str(e)}", exc_info=True)
             return None
