@@ -14,3 +14,6 @@ PyJWT==2.12.1
 aiofiles==23.2.1
 email-validator==2.1.0
 pytz==2023.3
+numpy>=1.24.0
+pandas>=2.0.0
+faker>=18.0.0

@@ -93,6 +93,7 @@ from app.routes.auth import router as auth_router
 from app.routes.spectra import router as spectra_router
 from app.routes.zeolites import router as zeolites_router
 from app.routes.similarity import router as similarity_router
+from app.routes.dataset import router as dataset_router
 
 logger.info("✅ Todos los routers importados")
 
@@ -126,11 +127,18 @@ app.include_router(
     tags=["similitud"]
 )
 
+app.include_router(
+    dataset_router,
+    prefix="/api/dataset",
+    tags=["dataset"]
+)
+
 logger.info("✅ Routers registrados:")
 logger.info("   ✅ /api/auth")
 logger.info("   ✅ /api/spectra")
 logger.info("   ✅ /api/zeolites")
 logger.info("   ✅ /api/similarity")
+logger.info("   ✅ /api/dataset")
 
 # ========================================
 # EVENTOS
