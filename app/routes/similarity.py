@@ -68,39 +68,107 @@ def normalize_spectrum(intensities):
     return (arr - min_val) / (max_val - min_val)
 
 def calculate_euclidean_similarity(spectrum1, spectrum2):
-    """Calcular similitud Euclidiana (0-1)"""
+    """Calcular similitud Euclidiana (0-1) - CORREGIDO"""
     try:
+        if len(spectrum1) == 0 or len(spectrum2) == 0:
+            return 0.0
         min_len = min(len(spectrum1), len(spectrum2))
         spec1 = spectrum1[:min_len]
         spec2 = spectrum2[:min_len]
         distance = euclidean(spec1, spec2)
         similarity = 1 / (1 + distance)
         return float(round(similarity, 4))
-    except:
+    except Exception as e:
+        logger.warning(f"Error en euclidean_similarity: {e}")
         return 0.0
 
 def calculate_cosine_similarity(spectrum1, spectrum2):
-    """Calcular similitud del coseno (0-1)"""
+    """Calcular similitud del coseno (0-1) - CORREGIDO"""
     try:
+        if len(spectrum1) == 0 or len(spectrum2) == 0:
+            return 0.0
         min_len = min(len(spectrum1), len(spectrum2))
         spec1 = spectrum1[:min_len]
         spec2 = spectrum2[:min_len]
-        similarity = 1 - cosine(spec1, spec2)
-        return float(round((similarity + 1) / 2, 4))
-    except:
+        # ✅ CORRECCIÓN: Fórmula correcta para convertir distancia coseno a similitud
+        distance = cosine(spec1, spec2)
+        similarity = (1 - distance) / 2  # Rango 0-1
+        return float(round(similarity, 4))
+    except Exception as e:
+        logger.warning(f"Error en cosine_similarity: {e}")
         return 0.0
 
 def calculate_pearson_similarity(spectrum1, spectrum2):
     """Calcular similitud de Pearson (0-1)"""
     try:
+        if len(spectrum1) < 2 or len(spectrum2) < 2:
+            return 0.0
         min_len = min(len(spectrum1), len(spectrum2))
         spec1 = spectrum1[:min_len]
         spec2 = spectrum2[:min_len]
         correlation, _ = pearsonr(spec1, spec2)
         similarity = (correlation + 1) / 2
         return float(round(similarity, 4))
-    except:
+    except Exception as e:
+        logger.warning(f"Error en pearson_similarity: {e}")
         return 0.0
+
+def detect_peaks_simple(wavenumbers: np.ndarray, absorbance: np.ndarray, threshold: float = 0.01) -> list:
+    """
+    Detectar picos locales en espectro normalizado
+    Retorna lista de wavenumbers donde hay picos
+    """
+    if len(absorbance) < 3:
+        return []
+
+    try:
+        # Normalizar absorbance
+        abs_arr = np.array(absorbance, dtype=float)
+        max_abs = np.max(abs_arr)
+        min_abs = np.min(abs_arr)
+
+        if max_abs == min_abs:
+            return []
+
+        norm_abs = (abs_arr - min_abs) / (max_abs - min_abs)
+        peaks = []
+
+        # Detectar máximos locales
+        for i in range(1, len(norm_abs) - 1):
+            if (norm_abs[i] > norm_abs[i-1] and
+                norm_abs[i] > norm_abs[i+1] and
+                norm_abs[i] > threshold):
+                peaks.append(float(wavenumbers[i]))
+
+        return peaks
+    except Exception as e:
+        logger.error(f"Error en detect_peaks_simple: {e}")
+        return []
+
+def match_peaks_simple(peaks1: list, peaks2: list, tolerance: float = 4) -> dict:
+    """
+    Emparejar picos entre dos espectros
+    Retorna dict con matched, unmatched, total y matched_count
+    """
+    matched = []
+    unmatched = []
+
+    for p1 in peaks1:
+        found = False
+        for p2 in peaks2:
+            if abs(p1 - p2) <= tolerance:
+                matched.append(p1)
+                found = True
+                break
+        if not found:
+            unmatched.append(p1)
+
+    return {
+        "matched": matched,
+        "unmatched": unmatched,
+        "total": len(peaks1),
+        "matched_count": len(matched)
+    }
 
 def get_spectrum_from_dataset(spectrum_id):
     """Obtener espectro desde el dataset"""
@@ -135,8 +203,10 @@ def get_spectrum_from_dataset(spectrum_id):
         logger.error(f"Error obteniendo espectro del dataset: {e}")
         return None
 
-def search_similar_in_dataset(spectrum_id, method="combined", top_n=10, min_similarity=0.5):
-    """Buscar espectros similares en el dataset"""
+def search_similar_in_dataset(spectrum_id, method="pearson", top_n=10, min_similarity=0.5, tolerance=4):
+    """
+    Buscar espectros similares en el dataset CON detección de picos
+    """
     try:
         connection = connect_dataset_db()
         if not connection:
@@ -162,6 +232,11 @@ def search_similar_in_dataset(spectrum_id, method="combined", top_n=10, min_simi
         ref_data = json.loads(ref_result[1])
         ref_intensities = np.array(ref_data["intensities"])
         ref_intensities_norm = normalize_spectrum(ref_intensities)
+
+        # ✅ NUEVO: Detectar picos en el espectro de referencia
+        ref_wavenumbers = np.array(range(len(ref_intensities)))
+        ref_peaks = detect_peaks_simple(ref_wavenumbers, ref_intensities_norm, threshold=0.01)
+        logger.debug(f"Picos detectados en referencia: {len(ref_peaks)}")
 
         # Obtener todos los espectros
         cursor.execute("""
@@ -197,13 +272,20 @@ def search_similar_in_dataset(spectrum_id, method="combined", top_n=10, min_simi
                 similarity = 0.0
 
             if similarity >= min_similarity:
+                # ✅ NUEVO: Detectar picos en este espectro y emparejar
+                spec_wavenumbers = np.array(range(len(spec_intensities)))
+                spec_peaks = detect_peaks_simple(spec_wavenumbers, spec_intensities_norm, threshold=0.01)
+                peak_match = match_peaks_simple(ref_peaks, spec_peaks, tolerance=tolerance)
+
                 similarities.append({
                     "spectrum_id": spec[0],
                     "sample_code": spec[2],
                     "zeolite_name": spec[3],
                     "equipment": spec[4],
                     "measurement_date": str(spec[5]) if spec[5] else "N/A",
-                    "similarity": similarity
+                    "similarity": similarity,
+                    "matching_peaks": peak_match["matched_count"],
+                    "total_peaks": peak_match["total"]
                 })
 
         cursor.close()
@@ -256,7 +338,7 @@ def search_similarity(
         logger.info(f"📊 Procesando {len(spectra_to_search)} espectros del usuario")
 
         config = request.config
-        method = config.method or "cosine"
+        method = config.method or "pearson"
         tolerance = config.tolerance or 4
         range_min = config.range_min or 400
         range_max = config.range_max or 4000
@@ -301,9 +383,10 @@ def search_similarity(
         # Búsqueda en dataset de zeolitas
         dataset_results = search_similar_in_dataset(
             request.query_spectrum_id,
-            method=method.lower() if method in ["euclidean", "cosine", "pearson"] else "combined",
+            method=method.lower() if method in ["euclidean", "cosine", "pearson"] else "pearson",
             top_n=top_n,
-            min_similarity=0.5
+            min_similarity=0.5,
+            tolerance=tolerance
         )
 
         for result in dataset_results:
@@ -313,8 +396,8 @@ def search_similarity(
                 "family": result["zeolite_name"],
                 "global_score": result["similarity"],
                 "window_scores": [],
-                "matching_peaks": 0,
-                "total_peaks": 0,
+                "matching_peaks": result.get("matching_peaks", 0),
+                "total_peaks": result.get("total_peaks", 0),
                 "source": "zeolite_dataset",
                 "equipment": result["equipment"],
                 "rank": 0
@@ -356,12 +439,12 @@ def search_similarity(
 
 @router.post("/compare", summary="CU-F-006: Comparar dos espectros")
 def compare_spectra(
-    query_id: int = Query(...),
-    reference_id: int = Query(...),
-    method: str = Query("cosine"),
-    tolerance: float = Query(4),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+        query_id: int = Query(...),
+        reference_id: int = Query(...),
+        method: str = Query("pearson"),
+        tolerance: float = Query(4),
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
 ):
     """
     Comparar dos espectros específicos
@@ -370,6 +453,14 @@ def compare_spectra(
 
     try:
         logger.info(f"🔄 Comparación - Usuario: {current_user.id}")
+        logger.info(f"   Query ID: {query_id} | Reference ID: {reference_id}")
+        logger.info(f"   Método: {method} | Tolerancia: {tolerance}")
+
+        # ✅ VALIDAR PARÁMETROS
+        valid_methods = ["cosine", "pearson", "euclidean"]
+        if method not in valid_methods:
+            method = "pearson"
+            logger.warning(f"⚠️ Método inválido, usando pearson")
 
         # Intentar obtener espectros del usuario
         query_spectrum = db.query(Spectrum).filter(
@@ -383,6 +474,8 @@ def compare_spectra(
         ).first()
 
         if query_spectrum and reference_spectrum:
+            logger.info(f"✅ Ambos espectros encontrados en usuario database")
+
             # Comparación entre espectros del usuario
             similarity_score = calculator.calculate_similarity(
                 spectrum1=query_spectrum,
@@ -394,11 +487,14 @@ def compare_spectra(
             )
 
             if similarity_score is None:
+                logger.error(f"❌ Calculator retornó None")
                 return {
                     "success": False,
                     "message": "No se pudo calcular similitud",
                     "data": None
                 }
+
+            logger.info(f"✅ Similitud calculada: {similarity_score.get('global_score', 0)}")
 
             return {
                 "success": True,
@@ -422,29 +518,85 @@ def compare_spectra(
                 }
             }
 
+        logger.info(f"🔍 Espectros no en usuario database, buscando en dataset...")
+
         # Intentar obtener del dataset
         query_dataset = get_spectrum_from_dataset(query_id)
         reference_dataset = get_spectrum_from_dataset(reference_id)
 
         if query_dataset and reference_dataset:
+            logger.info(f"✅ Ambos espectros encontrados en dataset")
+            logger.info(f"   Query: {query_dataset['sample_code']} | Reference: {reference_dataset['sample_code']}")
+
             query_intensities = np.array(query_dataset["spectrum_data"]["intensities"])
             ref_intensities = np.array(reference_dataset["spectrum_data"]["intensities"])
+
+            logger.info(f"   Datos cargados: Query {len(query_intensities)} puntos | Ref {len(ref_intensities)} puntos")
+
+            # ✅ VALIDAR DATOS NO VACÍOS
+            if len(query_intensities) == 0 or len(ref_intensities) == 0:
+                logger.error(f"❌ Espectros sin datos (vacíos)")
+                return {
+                    "success": False,
+                    "message": "Espectros sin datos para comparación",
+                    "data": None
+                }
 
             query_norm = normalize_spectrum(query_intensities)
             ref_norm = normalize_spectrum(ref_intensities)
 
+            logger.info(f"   Normalizados: Query min={np.min(query_norm):.4f}, max={np.max(query_norm):.4f}")
+            logger.info(f"   Normalizados: Ref min={np.min(ref_norm):.4f}, max={np.max(ref_norm):.4f}")
+
+            # ✅ CALCULAR TODOS LOS SCORES
             scores = {
                 "euclidean": calculate_euclidean_similarity(query_norm, ref_norm),
                 "cosine": calculate_cosine_similarity(query_norm, ref_norm),
                 "pearson": calculate_pearson_similarity(query_norm, ref_norm)
             }
 
+            logger.info(f"📈 Scores calculados:")
+            logger.info(f"   Euclidean: {scores['euclidean']:.4f}")
+            logger.info(f"   Cosine: {scores['cosine']:.4f}")
+            logger.info(f"   Pearson: {scores['pearson']:.4f}")
+
+            # ✅ OBTENER SCORE SELECCIONADO CON VALIDACIÓN
+            selected_score = scores.get(method, scores["pearson"])
+
+            # ✅ ASEGURAR RANGO 0-1
+            if selected_score < 0:
+                selected_score = 0.0
+            elif selected_score > 1:
+                selected_score = 1.0
+
+            selected_score = float(round(selected_score, 4))
+            logger.info(f"✅ Score final ({method}): {selected_score:.4f} ({selected_score * 100:.2f}%)")
+
+            # ✅ DETECTAR PICOS Y EMPAREJAR
+            query_wavenumbers = np.array(range(len(query_intensities)))
+            ref_wavenumbers = np.array(range(len(ref_intensities)))
+            query_peaks = detect_peaks_simple(query_wavenumbers, query_norm, threshold=0.01)
+            ref_peaks = detect_peaks_simple(ref_wavenumbers, ref_norm, threshold=0.01)
+            peak_match = match_peaks_simple(query_peaks, ref_peaks, tolerance=tolerance)
+
+            logger.info(f"🎯 Picos detectados: Query {len(query_peaks)} | Ref {len(ref_peaks)}")
+            logger.info(f"   Coincidencias: {peak_match['matched_count']}/{len(query_peaks)}")
+
             return {
                 "success": True,
                 "message": "Comparación completada",
                 "data": {
-                    "global_score": scores[method] if method in scores else 0.0,
-                    "all_scores": scores,
+                    "global_score": selected_score,
+                    "all_scores": {
+                        "euclidean": float(round(scores["euclidean"], 4)),
+                        "cosine": float(round(scores["cosine"], 4)),
+                        "pearson": float(round(scores["pearson"], 4))
+                    },
+                    "method_used": method,
+                    "matched_peaks": peak_match["matched"],
+                    "unmatched_peaks": peak_match["unmatched"],
+                    "total_peaks": peak_match["total"],
+                    "matching_peaks_count": peak_match["matched_count"],
                     "query_spectrum": {
                         "id": query_dataset["id"],
                         "filename": query_dataset["sample_code"],
@@ -460,12 +612,13 @@ def compare_spectra(
                 }
             }
 
+        logger.error(f"❌ Espectros no encontrados en ninguna BD")
         raise HTTPException(status_code=404, detail="Espectros no encontrados")
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error en comparación: {str(e)}")
+        logger.error(f"❌ Error en comparación: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
