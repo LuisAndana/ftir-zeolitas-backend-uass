@@ -92,6 +92,7 @@ logger.info("📦 Importando routers...")
 from app.routes.auth import router as auth_router
 from app.routes.spectra import router as spectra_router
 from app.routes.zeolites import router as zeolites_router
+from app.routes.similarity import router as similarity_router
 
 logger.info("✅ Todos los routers importados")
 
@@ -119,10 +120,17 @@ app.include_router(
     tags=["zeolitas"]
 )
 
+app.include_router(
+    similarity_router,
+    prefix="/api/similarity",
+    tags=["similitud"]
+)
+
 logger.info("✅ Routers registrados:")
 logger.info("   ✅ /api/auth")
 logger.info("   ✅ /api/spectra")
 logger.info("   ✅ /api/zeolites")
+logger.info("   ✅ /api/similarity")
 
 # ========================================
 # EVENTOS
