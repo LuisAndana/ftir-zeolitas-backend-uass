@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Dict, List, Tuple, Optional
 
-from app.core.database import get_db, SessionLocal
+from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.spectrum import Spectrum
 from app.models.user import User
@@ -547,18 +547,18 @@ def compare_spectra(
 
 
 # ========================================
-# ✅ GET SPECTRUM PARA COMPARACIÓN
-# Busca en AMBAS bases de datos
-# ========================================
-
-# ========================================
-# ✅ NUEVO ENDPOINT - GET SPECTRUM PARA COMPARACIÓN
+# ✅ ENDPOINT UNIFICADO - GET SPECTRUM PARA COMPARACIÓN
+# Busca en AMBAS bases de datos con autenticación
 # ========================================
 
 @router.get("/spectrum-for-comparison/{spectrum_id}")
-def get_spectrum_for_comparison(spectrum_id: int):
+def get_spectrum_for_comparison(
+    spectrum_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Obtener espectro para comparación (busca en dataset + usuario DB)"""
-    logger.info(f"🔍 GET /spectrum-for-comparison/{spectrum_id}")
+    logger.info(f"🔍 GET /spectrum-for-comparison/{spectrum_id} - Usuario: {current_user.id}")
 
     try:
         # ========================================
@@ -581,13 +581,18 @@ def get_spectrum_for_comparison(spectrum_id: int):
 
             if result:
                 logger.info(f"✅ Espectro encontrado en DATASET: {result[2]}")
+                wavenumbers = []
+                intensities = []
                 try:
-                    spectrum_data = json.loads(result[1])
-                    wavenumbers = spectrum_data.get("wavenumbers", [])
-                    intensities = spectrum_data.get("intensities", spectrum_data.get("absorbance", []))
-                except:
-                    wavenumbers = []
-                    intensities = []
+                    spectrum_data = json.loads(result[1]) if result[1] else {}
+                    wavenumbers = spectrum_data.get("wavenumbers") or []
+                    intensities = (
+                        spectrum_data.get("intensities")
+                        or spectrum_data.get("absorbance")
+                        or []
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ Error parseando spectrum_data del dataset para espectro {spectrum_id}: {e}")
 
                 return {
                     "success": True,
@@ -596,7 +601,7 @@ def get_spectrum_for_comparison(spectrum_id: int):
                         "id": result[0],
                         "filename": result[2],
                         "family": result[3],
-                        "equipment": result[4],
+                        "equipment": result[4] or "N/A",
                         "spectrum_data": {
                             "wavenumbers": wavenumbers,
                             "intensities": intensities
@@ -606,52 +611,54 @@ def get_spectrum_for_comparison(spectrum_id: int):
                 }
 
         # ========================================
-        # FALLBACK: Buscar en usuario DB
+        # FALLBACK: Buscar en usuario DB (filtrado por usuario autenticado)
         # ========================================
         logger.info(f"⚠️ No en dataset, buscando en usuario DB...")
 
-        db = SessionLocal()
-        try:
-            spectrum = db.query(Spectrum).filter(Spectrum.id == spectrum_id).first()
+        spectrum = db.query(Spectrum).filter(
+            Spectrum.id == spectrum_id,
+            Spectrum.user_id == current_user.id
+        ).first()
 
-            if spectrum:
-                logger.info(f"✅ Espectro encontrado en USER DB: {spectrum.filename}")
+        if spectrum:
+            logger.info(f"✅ Espectro encontrado en USER DB: {spectrum.filename}")
 
-                # Parsear wavenumber_data
-                wavenumbers = []
-                intensities = []
+            wavenumbers = []
+            intensities = []
 
-                if spectrum.wavenumber_data:
-                    try:
-                        data = json.loads(spectrum.wavenumber_data)
-                        wavenumbers = data.get("wavenumbers", [])
-                        intensities = data.get("intensities", data.get("absorbance", []))
-                    except:
-                        pass
+            if spectrum.wavenumber_data:
+                try:
+                    data = json.loads(spectrum.wavenumber_data)
+                    wavenumbers = data.get("wavenumbers") or []
+                    intensities = (
+                        data.get("intensities")
+                        or data.get("absorbance")
+                        or []
+                    )
+                except Exception as e:
+                    logger.warning(f"⚠️ Error parseando wavenumber_data del usuario para espectro {spectrum_id}: {e}")
 
-                return {
-                    "success": True,
-                    "source": "user",
-                    "spectrum": {
-                        "id": spectrum.id,
-                        "filename": spectrum.filename,
-                        "family": spectrum.material or "N/A",
-                        "equipment": spectrum.technique or "N/A",
-                        "spectrum_data": {
-                            "wavenumbers": wavenumbers,
-                            "intensities": intensities
-                        },
-                        "source": "user_database"
-                    }
+            return {
+                "success": True,
+                "source": "user",
+                "spectrum": {
+                    "id": spectrum.id,
+                    "filename": spectrum.filename,
+                    "family": spectrum.material or "N/A",
+                    "equipment": spectrum.technique or "N/A",
+                    "spectrum_data": {
+                        "wavenumbers": wavenumbers,
+                        "intensities": intensities
+                    },
+                    "source": "user_database"
                 }
-        finally:
-            db.close()
+            }
 
         # ========================================
         # NO ENCONTRADO
         # ========================================
         logger.warning(f"❌ Espectro {spectrum_id} no encontrado en ninguna BD")
-        raise HTTPException(status_code=404, detail=f"Espectro no encontrado")
+        raise HTTPException(status_code=404, detail="Espectro no encontrado")
 
     except HTTPException:
         raise
