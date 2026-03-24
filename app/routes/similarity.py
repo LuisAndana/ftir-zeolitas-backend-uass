@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Dict, List, Tuple, Optional
 
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.core.security import get_current_user
 from app.models.spectrum import Spectrum
 from app.models.user import User
@@ -546,6 +546,123 @@ def compare_spectra(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ========================================
+# ✅ GET SPECTRUM PARA COMPARACIÓN
+# Busca en AMBAS bases de datos
+# ========================================
+
+# ========================================
+# ✅ NUEVO ENDPOINT - GET SPECTRUM PARA COMPARACIÓN
+# ========================================
+
+@router.get("/spectrum-for-comparison/{spectrum_id}")
+def get_spectrum_for_comparison(spectrum_id: int):
+    """Obtener espectro para comparación (busca en dataset + usuario DB)"""
+    logger.info(f"🔍 GET /spectrum-for-comparison/{spectrum_id}")
+
+    try:
+        # ========================================
+        # INTENTAR DATASET PRIMERO
+        # ========================================
+        connection = connect_dataset_db()
+        if connection:
+            cursor = connection.cursor()
+            cursor.execute("""
+                SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
+                FROM ftir_spectra fs
+                JOIN zeolite_samples zs ON fs.sample_id = zs.id
+                JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
+                WHERE fs.id = %s
+            """, (spectrum_id,))
+
+            result = cursor.fetchone()
+            cursor.close()
+            connection.close()
+
+            if result:
+                logger.info(f"✅ Espectro encontrado en DATASET: {result[2]}")
+                try:
+                    spectrum_data = json.loads(result[1])
+                    wavenumbers = spectrum_data.get("wavenumbers", [])
+                    intensities = spectrum_data.get("intensities", spectrum_data.get("absorbance", []))
+                except:
+                    wavenumbers = []
+                    intensities = []
+
+                return {
+                    "success": True,
+                    "source": "dataset",
+                    "spectrum": {
+                        "id": result[0],
+                        "filename": result[2],
+                        "family": result[3],
+                        "equipment": result[4],
+                        "spectrum_data": {
+                            "wavenumbers": wavenumbers,
+                            "intensities": intensities
+                        },
+                        "source": "zeolite_dataset"
+                    }
+                }
+
+        # ========================================
+        # FALLBACK: Buscar en usuario DB
+        # ========================================
+        logger.info(f"⚠️ No en dataset, buscando en usuario DB...")
+
+        db = SessionLocal()
+        try:
+            spectrum = db.query(Spectrum).filter(Spectrum.id == spectrum_id).first()
+
+            if spectrum:
+                logger.info(f"✅ Espectro encontrado en USER DB: {spectrum.filename}")
+
+                # Parsear wavenumber_data
+                wavenumbers = []
+                intensities = []
+
+                if spectrum.wavenumber_data:
+                    try:
+                        data = json.loads(spectrum.wavenumber_data)
+                        wavenumbers = data.get("wavenumbers", [])
+                        intensities = data.get("intensities", data.get("absorbance", []))
+                    except:
+                        pass
+
+                return {
+                    "success": True,
+                    "source": "user",
+                    "spectrum": {
+                        "id": spectrum.id,
+                        "filename": spectrum.filename,
+                        "family": spectrum.material or "N/A",
+                        "equipment": spectrum.technique or "N/A",
+                        "spectrum_data": {
+                            "wavenumbers": wavenumbers,
+                            "intensities": intensities
+                        },
+                        "source": "user_database"
+                    }
+                }
+        finally:
+            db.close()
+
+        # ========================================
+        # NO ENCONTRADO
+        # ========================================
+        logger.warning(f"❌ Espectro {spectrum_id} no encontrado en ninguna BD")
+        raise HTTPException(status_code=404, detail=f"Espectro no encontrado")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+# ========================================
+# GET DATASET SPECTRA
+# ========================================
+
 @router.get("/dataset/spectra")
 def get_dataset_spectra(
         limit: int = Query(5000, ge=1, le=5000),
@@ -613,6 +730,11 @@ def get_dataset_spectra(
     except Exception as e:
         logger.error(f"Error obteniendo dataset: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========================================
+# GET SPECTRUM INFO
+# ========================================
 
 @router.get("/spectrum/{spectrum_id}")
 def get_spectrum_info(spectrum_id: int):
