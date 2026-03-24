@@ -1,5 +1,5 @@
 """
-Rutas para carga y gestión de espectros - CON MANEJO DE ERRORES MEJORADO
+Rutas para carga y gestión de espectros - CON MANEJO DE ERRORES MEJORADO Y LOGS DE DEBUG
 """
 
 import logging
@@ -160,6 +160,13 @@ async def upload_spectrum(
 
     logger.info(f"📤 POST /upload - Usuario: {current_user.id}, Archivo: {file.filename}")
 
+    # ✅ LOGS DE DEBUG PARA VER QUÉ SE RECIBE
+    logger.info(f"   📋 Parámetros recibidos:")
+    logger.info(f"      - material: '{material}' (tipo: {type(material).__name__})")
+    logger.info(f"      - technique: '{technique}' (tipo: {type(technique).__name__})")
+    logger.info(f"      - hydration_state: '{hydration_state}' (tipo: {type(hydration_state).__name__})")
+    logger.info(f"      - temperature: '{temperature}' (tipo: {type(temperature).__name__})")
+
     try:
         # Leer contenido del archivo
         content = await file.read()
@@ -169,14 +176,27 @@ async def upload_spectrum(
         wavenumber_data = parse_spectrum_file(content, file.filename or "")
         logger.debug(f"✅ Archivo parseado: {len(wavenumber_data.get('wavenumbers', []))} puntos")
 
+        # ✅ DEFINIR VALORES POR DEFECTO
+        final_material = material if material and material.strip() else "Desconocido"
+        final_technique = technique if technique and technique.strip() else "ATR"
+        final_hydration = hydration_state if hydration_state and hydration_state.strip() else "As-synthesized"
+        final_temperature = temperature if temperature and temperature.strip() else "25°C"
+
+        # ✅ LOGS DE LOS VALORES FINALES
+        logger.info(f"   ✅ Valores finales a guardar:")
+        logger.info(f"      - material final: '{final_material}'")
+        logger.info(f"      - technique final: '{final_technique}'")
+        logger.info(f"      - hydration final: '{final_hydration}'")
+        logger.info(f"      - temperature final: '{final_temperature}'")
+
         # Crear espectro en BD
         spectrum = Spectrum(
             filename=file.filename or "spectrum",
             user_id=current_user.id,
-            material=material or "Desconocido",
-            technique=technique or "ATR",
-            hydration_state=hydration_state or "As-synthesized",
-            temperature=temperature or "25°C"
+            material=final_material,
+            technique=final_technique,
+            hydration_state=final_hydration,
+            temperature=final_temperature
         )
 
         # Guardar datos de wavenumber en JSON
@@ -190,6 +210,12 @@ async def upload_spectrum(
             db.commit()
             db.refresh(spectrum)
             logger.info(f"✅ Espectro guardado en BD: ID {spectrum.id}")
+            logger.info(f"   Datos guardados:")
+            logger.info(f"      - filename: {spectrum.filename}")
+            logger.info(f"      - material: {spectrum.material}")
+            logger.info(f"      - technique: {spectrum.technique}")
+            logger.info(f"      - hydration_state: {spectrum.hydration_state}")
+            logger.info(f"      - temperature: {spectrum.temperature}")
         except SQLAlchemyError as e:
             logger.error(f"❌ Error guardando en BD: {e}", exc_info=True)
             db.rollback()
