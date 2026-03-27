@@ -1,5 +1,10 @@
 """
-⚡ BÚSQUEDA DE SIMILITUD ULTRA-OPTIMIZADA CON MANEJO DE ERRORES
+⚡ BÚSQUEDA DE SIMILITUD ULTRA-OPTIMIZADA
+✅ FIXES v2:
+- detect_peaks_vectorized ahora usa wavenumbers REALES (no índices)
+- match_peaks_vectorized usa tolerancia en cm⁻¹ correctamente
+- search_similar_in_dataset_ultra_fast pasa wavenumbers reales a detect_peaks
+- Mejor manejo de conexiones MySQL con try-finally
 """
 
 import logging
@@ -78,7 +83,9 @@ def get_db_config():
     }
 
 def connect_dataset_db():
-    """Conectar a la base de datos del dataset"""
+    """
+    ✅ Conectar a la base de datos del dataset
+    """
     try:
         config = get_db_config()
         connection = mysql.connector.connect(
@@ -89,9 +96,13 @@ def connect_dataset_db():
             autocommit=True,
             connection_timeout=5
         )
+        logger.debug(f"✅ Conexión exitosa a dataset: {config['host']}/{config['database']}")
         return connection
     except Error as e:
-        logger.error(f"❌ Error conexión dataset: {e}")
+        logger.error(f"❌ Error en conexión dataset: {type(e).__name__}: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Error inesperado en conexión dataset: {type(e).__name__}: {str(e)}")
         return None
 
 # ========================================
@@ -99,7 +110,7 @@ def connect_dataset_db():
 # ========================================
 
 def normalize_spectrum(intensities: np.ndarray) -> np.ndarray:
-    """Normalizar espectro"""
+    """Normalizar espectro 0-1"""
     arr = np.array(intensities, dtype=np.float32)
     min_val = np.min(arr)
     max_val = np.max(arr)
@@ -152,55 +163,140 @@ def calculate_similarities_vectorized(
         return np.array([0.5] * len(test_spectra))
 
     except Exception as e:
-        logger.warning(f"Error cálculo vectorizado: {e}")
+        logger.warning(f"⚠️ Error cálculo vectorizado: {e}")
         return np.array([0.0] * len(test_spectra))
 
-def detect_peaks_vectorized(wavenumbers: np.ndarray, absorbance: np.ndarray, threshold: float = 0.01) -> List[float]:
-    """Detectar picos vectorizadamente"""
-    if len(absorbance) < 3:
+
+# ========================================
+# ✅ FIX CRÍTICO: detect_peaks_vectorized
+# Antes usaba np.arange(len(absorbance)) como wavenumbers → INCORRECTO
+# Ahora recibe wavenumbers REALES y los usa para reportar picos en cm⁻¹
+# ========================================
+
+def detect_peaks_vectorized(
+    wavenumbers: np.ndarray,
+    absorbance: np.ndarray,
+    threshold: float = 0.05,
+    min_distance_cm: float = 10.0
+) -> List[float]:
+    """
+    ✅ FIX: Detectar picos usando wavenumbers REALES (cm⁻¹).
+
+    Args:
+        wavenumbers: Array de números de onda reales en cm⁻¹ (ej. 400-4000)
+        absorbance:  Array de absorbancia correspondiente
+        threshold:   Altura mínima normalizada (0-1) para considerar un pico
+        min_distance_cm: Distancia mínima entre picos en cm⁻¹
+
+    Returns:
+        Lista de posiciones de pico en cm⁻¹ reales
+    """
+    wn = np.array(wavenumbers, dtype=np.float32)
+    ab = np.array(absorbance, dtype=np.float32)
+
+    if len(wn) < 3 or len(ab) < 3:
         return []
+
+    n = min(len(wn), len(ab))
+    wn = wn[:n]
+    ab = ab[:n]
 
     try:
-        abs_arr = np.array(absorbance, dtype=np.float32)
-        max_abs = np.max(abs_arr)
-        min_abs = np.min(abs_arr)
-
-        if max_abs == min_abs:
+        # Normalizar absorbancia 0-1
+        min_ab = np.min(ab)
+        max_ab = np.max(ab)
+        if max_ab == min_ab:
             return []
 
-        norm_abs = (abs_arr - min_abs) / (max_abs - min_abs)
-        is_greater_left = norm_abs[1:-1] > norm_abs[:-2]
-        is_greater_right = norm_abs[1:-1] > norm_abs[2:]
-        is_peak = is_greater_left & is_greater_right & (norm_abs[1:-1] > threshold)
+        norm_ab = (ab - min_ab) / (max_ab - min_ab)
 
-        peak_indices = np.where(is_peak)[0] + 1
-        return [float(wavenumbers[i]) for i in peak_indices]
+        # Suavizado con ventana de 5 puntos para reducir ruido
+        kernel = np.ones(5) / 5
+        smoothed = np.convolve(norm_ab, kernel, mode='same')
+
+        # Detectar máximos locales
+        is_greater_left  = smoothed[1:-1] > smoothed[:-2]
+        is_greater_right = smoothed[1:-1] > smoothed[2:]
+        above_threshold  = smoothed[1:-1] > threshold
+        is_peak = is_greater_left & is_greater_right & above_threshold
+
+        peak_indices = np.where(is_peak)[0] + 1  # +1 por el offset del slice
+
+        if len(peak_indices) == 0:
+            return []
+
+        # ✅ Usar wavenumbers REALES para las posiciones de los picos
+        peak_wavenumbers_cm = wn[peak_indices].tolist()
+        peak_heights = smoothed[peak_indices].tolist()
+
+        # Ordenar por altura descendente para filtrar por distancia mínima
+        sorted_peaks = sorted(
+            zip(peak_wavenumbers_cm, peak_heights),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # Filtrar picos demasiado cercanos (mantener el más alto)
+        filtered: List[float] = []
+        for wn_val, _ in sorted_peaks:
+            if all(abs(wn_val - existing) >= min_distance_cm for existing in filtered):
+                filtered.append(wn_val)
+
+        # Retornar ordenados por wavenumber ascendente
+        filtered.sort()
+
+        logger.debug(f"🔍 detect_peaks: {len(filtered)} picos encontrados en cm⁻¹: {filtered[:5]}...")
+        return filtered
 
     except Exception as e:
-        logger.debug(f"Error detect_peaks: {e}")
+        logger.debug(f"⚠️ Error detect_peaks: {e}")
         return []
 
-def match_peaks_vectorized(peaks1: List[float], peaks2: List[float], tolerance: float = 4) -> Dict:
-    """Emparejar picos vectorizadamente"""
+
+def match_peaks_vectorized(
+    peaks1: List[float],
+    peaks2: List[float],
+    tolerance: float = 4.0
+) -> Dict:
+    """
+    ✅ Emparejar picos en cm⁻¹ con tolerancia en cm⁻¹.
+
+    Args:
+        peaks1:    Picos del espectro de consulta (cm⁻¹)
+        peaks2:    Picos del espectro de referencia (cm⁻¹)
+        tolerance: Tolerancia máxima para considerar picos coincidentes (cm⁻¹)
+
+    Returns:
+        Dict con matched, unmatched, total, matched_count
+    """
     if not peaks1 or not peaks2:
-        return {"matched": [], "unmatched": peaks1, "total": len(peaks1), "matched_count": 0}
+        return {
+            "matched": [],
+            "unmatched": peaks1 or [],
+            "total": len(peaks1) if peaks1 else 0,
+            "matched_count": 0
+        }
 
     peaks1_arr = np.array(peaks1, dtype=np.float32)
     peaks2_arr = np.array(peaks2, dtype=np.float32)
 
+    # Matriz de distancias |peaks1[i] - peaks2[j]|
     distances = np.abs(peaks1_arr[:, np.newaxis] - peaks2_arr[np.newaxis, :])
+
+    # Un pico de peaks1 es "matched" si existe algún pico en peaks2 a ≤ tolerance cm⁻¹
     matched_mask = np.any(distances <= tolerance, axis=1)
-    matched_count = np.sum(matched_mask)
+    matched_count = int(np.sum(matched_mask))
 
     return {
         "matched": peaks1_arr[matched_mask].tolist(),
         "unmatched": peaks1_arr[~matched_mask].tolist(),
         "total": len(peaks1),
-        "matched_count": int(matched_count)
+        "matched_count": matched_count
     }
 
+
 # ========================================
-# BÚSQUEDA EN DATASET
+# ✅ FIX: BÚSQUEDA EN DATASET CON WAVENUMBERS REALES
 # ========================================
 
 def search_similar_in_dataset_ultra_fast(
@@ -213,8 +309,11 @@ def search_similar_in_dataset_ultra_fast(
 ) -> List[Dict]:
     """
     ⚡ BÚSQUEDA ULTRA-OPTIMIZADA EN DATASET
+    ✅ FIX: Usa wavenumbers reales para detección de picos
     """
     start_time = time.time()
+    connection = None
+    cursor = None
 
     try:
         connection = connect_dataset_db()
@@ -224,7 +323,6 @@ def search_similar_in_dataset_ultra_fast(
 
         cursor = connection.cursor()
 
-        # ✅ Obtener espectro de referencia
         cursor.execute("""
             SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment
             FROM ftir_spectra fs
@@ -236,27 +334,33 @@ def search_similar_in_dataset_ultra_fast(
         ref_result = cursor.fetchone()
         if not ref_result:
             logger.warning(f"⚠️ Espectro de referencia {spectrum_id} no encontrado en dataset")
-            cursor.close()
-            connection.close()
             return []
 
         try:
-            ref_data = json.loads(ref_result[1])
-            ref_intensities = np.array(ref_data.get("intensities", []), dtype=np.float32)
+            ref_data = json.loads(ref_result[1]) if ref_result[1] else {}
+            ref_intensities = np.array(
+                ref_data.get("intensities") or ref_data.get("absorbance") or [],
+                dtype=np.float32
+            )
+            # ✅ FIX: Cargar wavenumbers reales del espectro de referencia
+            ref_wavenumbers = np.array(
+                ref_data.get("wavenumbers") or list(range(len(ref_intensities))),
+                dtype=np.float32
+            )
+
             if len(ref_intensities) == 0:
                 logger.warning("⚠️ Espectro de referencia vacío")
                 return []
         except Exception as e:
-            logger.warning(f"⚠️ Error parseando espectro: {e}")
+            logger.error(f"❌ Error parseando espectro de referencia: {e}")
             return []
 
         ref_intensities_norm = normalize_spectrum(ref_intensities)
-        ref_wavenumbers = np.arange(len(ref_intensities))
-        ref_peaks = detect_peaks_vectorized(ref_wavenumbers, ref_intensities_norm)
 
-        logger.debug(f"Picos detectados: {len(ref_peaks)}")
+        # ✅ FIX: Pasar wavenumbers REALES a detect_peaks
+        ref_peaks = detect_peaks_vectorized(ref_wavenumbers, ref_intensities_norm, threshold=0.05)
+        logger.debug(f"📊 Picos detectados en referencia: {len(ref_peaks)} (en cm⁻¹)")
 
-        # ✅ Cargar TODOS los espectros de una sola vez
         cursor.execute("""
             SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
             FROM ftir_spectra fs
@@ -267,8 +371,6 @@ def search_similar_in_dataset_ultra_fast(
         """, (spectrum_id,))
 
         all_spectra = cursor.fetchall()
-        cursor.close()
-        connection.close()
 
         if not all_spectra:
             logger.warning("⚠️ No hay espectros en el dataset para comparar")
@@ -277,8 +379,6 @@ def search_similar_in_dataset_ultra_fast(
         logger.info(f"📊 Procesando {len(all_spectra)} espectros del dataset")
 
         similarities = []
-
-        # ✅ Dividir en lotes y procesar en paralelo
         batch_size = 250
         batches = [all_spectra[i:i+batch_size] for i in range(0, len(all_spectra), batch_size)]
 
@@ -286,40 +386,53 @@ def search_similar_in_dataset_ultra_fast(
             batch_results = []
             try:
                 intensities_list = []
+                wavenumbers_list = []
                 spec_info = []
 
                 for spec_tuple in batch:
                     try:
-                        spec_data = json.loads(spec_tuple[1])
-                        intensities = np.array(spec_data.get("intensities", []), dtype=np.float32)
+                        spec_data = json.loads(spec_tuple[1]) if spec_tuple[1] else {}
+                        intensities = np.array(
+                            spec_data.get("intensities") or spec_data.get("absorbance") or [],
+                            dtype=np.float32
+                        )
+                        # ✅ FIX: Cargar wavenumbers reales de cada espectro
+                        wavenumbers = np.array(
+                            spec_data.get("wavenumbers") or list(range(len(intensities))),
+                            dtype=np.float32
+                        )
                         if len(intensities) > 0:
                             intensities_list.append(intensities)
+                            wavenumbers_list.append(wavenumbers)
                             spec_info.append(spec_tuple)
-                    except:
+                    except Exception as e:
+                        logger.debug(f"⚠️ Error procesando espectro {spec_tuple[0]}: {e}")
                         continue
 
                 if not intensities_list:
                     return batch_results
 
-                # Normalizar lote
                 max_len = max(len(i) for i in intensities_list)
-                intensities_array = np.array([np.pad(i, (0, max_len - len(i)), 'constant')
-                                              for i in intensities_list])
+                intensities_array = np.array([
+                    np.pad(i, (0, max_len - len(i)), 'constant')
+                    for i in intensities_list
+                ])
                 normalized_batch = normalize_spectra_batch(intensities_array)
 
-                # Calcular similitudes
                 similarities_batch = calculate_similarities_vectorized(
                     ref_intensities_norm,
-                    [norm_batch for norm_batch in normalized_batch],
+                    [nb for nb in normalized_batch],
                     method
                 )
 
-                # Procesar resultados
                 for idx, (similarity, spec_info_tuple) in enumerate(zip(similarities_batch, spec_info)):
                     if similarity >= min_similarity:
                         spec_intensities_norm = normalized_batch[idx]
-                        spec_wavenumbers = np.arange(len(spec_intensities_norm))
-                        spec_peaks = detect_peaks_vectorized(spec_wavenumbers, spec_intensities_norm)
+                        # ✅ FIX: Usar wavenumbers reales del espectro comparado
+                        spec_wn = wavenumbers_list[idx]
+                        spec_peaks = detect_peaks_vectorized(
+                            spec_wn, spec_intensities_norm, threshold=0.05
+                        )
                         peak_match = match_peaks_vectorized(ref_peaks, spec_peaks, tolerance)
 
                         batch_results.append({
@@ -333,27 +446,39 @@ def search_similar_in_dataset_ultra_fast(
                             "total_peaks": peak_match["total"]
                         })
             except Exception as e:
-                logger.debug(f"Error procesando lote: {e}")
+                logger.error(f"❌ Error procesando lote: {e}")
 
             return batch_results
 
-        # Ejecutar en paralelo
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(process_batch, batch) for batch in batches]
             for future in as_completed(futures):
-                batch_results = future.result()
-                similarities.extend(batch_results)
+                try:
+                    batch_results = future.result()
+                    similarities.extend(batch_results)
+                except Exception as e:
+                    logger.error(f"❌ Error en future: {e}")
 
         similarities.sort(key=lambda x: x["similarity"], reverse=True)
-
         elapsed = time.time() - start_time
         logger.info(f"⚡ Dataset procesado en {elapsed:.2f}s - {len(similarities)} resultados")
-
         return similarities[:top_n]
 
     except Exception as e:
-        logger.error(f"❌ Error búsqueda dataset: {e}")
+        logger.error(f"❌ Error búsqueda dataset: {type(e).__name__}: {str(e)}", exc_info=True)
         return []
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                logger.warning(f"⚠️ Error cerrando cursor: {e}")
+        if connection and connection.is_connected():
+            try:
+                connection.close()
+            except Exception as e:
+                logger.warning(f"⚠️ Error cerrando conexión: {e}")
+
 
 # ========================================
 # ENDPOINTS
@@ -365,14 +490,12 @@ def search_similarity(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """⚡ Búsqueda ultra-rápida"""
-
+    """⚡ Búsqueda ultra-rápida de similitud"""
     start_time = time.time()
 
     try:
-        logger.info(f"🔍 Búsqueda - Usuario: {current_user.id}")
+        logger.info(f"🔍 Búsqueda iniciada - Usuario: {current_user.id}")
 
-        # Obtener espectros del usuario
         query_spectrum = db.query(Spectrum).filter(
             Spectrum.id == request.query_spectrum_id,
             Spectrum.user_id == current_user.id
@@ -396,16 +519,13 @@ def search_similarity(
 
         results = []
 
-        # ✅ Búsqueda en usuario
         if len(spectra_to_search) > 0:
             logger.info(f"⚡ Buscando en {len(spectra_to_search)} espectros del usuario...")
-
             user_results = []
 
             for spectrum in spectra_to_search:
                 if family_filter and spectrum.material != family_filter:
                     continue
-
                 try:
                     similarity_score = calculator.calculate_similarity(
                         spectrum1=query_spectrum,
@@ -415,7 +535,6 @@ def search_similarity(
                         range_min=range_min,
                         range_max=range_max
                     )
-
                     if similarity_score:
                         user_results.append({
                             "spectrum_id": spectrum.id,
@@ -429,14 +548,11 @@ def search_similarity(
                             "rank": 0
                         })
                 except Exception as e:
-                    logger.debug(f"Error comparando espectro {spectrum.id}: {e}")
+                    logger.debug(f"⚠️ Error comparando espectro {spectrum.id}: {e}")
 
             results.extend(user_results)
-            logger.info(f"✅ {len(user_results)} resultados del usuario")
 
-        # ✅ Búsqueda en dataset
         logger.info(f"⚡ Iniciando búsqueda en dataset...")
-
         dataset_results = search_similar_in_dataset_ultra_fast(
             request.query_spectrum_id,
             method=method.lower() if method in ["euclidean", "cosine", "pearson"] else "pearson",
@@ -462,13 +578,11 @@ def search_similarity(
 
         results.sort(key=lambda x: x["global_score"], reverse=True)
         results = results[:top_n]
-
         for i, result in enumerate(results, 1):
             result["rank"] = i
 
         execution_time_ms = int((time.time() - start_time) * 1000)
-
-        logger.info(f"⚡ Búsqueda completada en {execution_time_ms}ms")
+        logger.info(f"✅ Búsqueda completada en {execution_time_ms}ms")
 
         return {
             "success": True,
@@ -491,7 +605,7 @@ def search_similarity(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"❌ Error en búsqueda: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error en búsqueda: {str(e)}")
 
 
@@ -505,9 +619,9 @@ def compare_spectra(
     current_user: User = Depends(get_current_user)
 ):
     """Comparar dos espectros"""
+    logger.info(f"🔄 Comparación: Query={query_id}, Reference={reference_id}")
 
     try:
-        # Buscar en BD del usuario primero
         query_spectrum = db.query(Spectrum).filter(
             Spectrum.id == query_id,
             Spectrum.user_id == current_user.id
@@ -518,26 +632,84 @@ def compare_spectra(
             Spectrum.user_id == current_user.id
         ).first()
 
-        if query_spectrum and reference_spectrum:
-            similarity_score = calculator.calculate_similarity(
-                spectrum1=query_spectrum,
-                spectrum2=reference_spectrum,
-                method=method,
-                tolerance=tolerance
-            )
+        if not query_spectrum or not reference_spectrum:
+            raise HTTPException(status_code=404, detail="Espectros no encontrados")
 
-            return {
-                "success": True,
-                "message": "Comparación completada",
-                "data": {
-                    "query": {"id": query_spectrum.id, "filename": query_spectrum.filename},
-                    "reference": {"id": reference_spectrum.id, "filename": reference_spectrum.filename},
-                    "method": method,
-                    "global_score": similarity_score.get("global_score", 0) if similarity_score else 0
-                }
+        # ✅ FIX: Calcular picos con wavenumbers reales antes de enviar al calculator
+        try:
+            q_data = json.loads(query_spectrum.wavenumber_data) if query_spectrum.wavenumber_data else {}
+            r_data = json.loads(reference_spectrum.wavenumber_data) if reference_spectrum.wavenumber_data else {}
+
+            q_wn   = np.array(q_data.get("wavenumbers") or [], dtype=np.float32)
+            q_abs  = np.array(q_data.get("absorbance") or q_data.get("intensities") or [], dtype=np.float32)
+            r_wn   = np.array(r_data.get("wavenumbers") or [], dtype=np.float32)
+            r_abs  = np.array(r_data.get("absorbance") or r_data.get("intensities") or [], dtype=np.float32)
+
+            # Fallback: si no hay wavenumbers guardados, generar un rango aproximado
+            if len(q_wn) == 0 and len(q_abs) > 0:
+                q_wn = np.linspace(400, 4000, len(q_abs))
+            if len(r_wn) == 0 and len(r_abs) > 0:
+                r_wn = np.linspace(400, 4000, len(r_abs))
+
+            q_norm = normalize_spectrum(q_abs) if len(q_abs) > 0 else np.array([])
+            r_norm = normalize_spectrum(r_abs) if len(r_abs) > 0 else np.array([])
+
+            q_peaks = detect_peaks_vectorized(q_wn, q_norm, threshold=0.05) if len(q_wn) > 0 else []
+            r_peaks = detect_peaks_vectorized(r_wn, r_norm, threshold=0.05) if len(r_wn) > 0 else []
+
+            peak_match = match_peaks_vectorized(q_peaks, r_peaks, tolerance)
+
+        except Exception as e:
+            logger.warning(f"⚠️ Error calculando picos locales: {e}")
+            q_peaks, r_peaks = [], []
+            peak_match = {"matched": [], "unmatched": [], "total": 0, "matched_count": 0}
+
+        similarity_score = calculator.calculate_similarity(
+            spectrum1=query_spectrum,
+            spectrum2=reference_spectrum,
+            method=method,
+            tolerance=tolerance
+        )
+
+        if not similarity_score:
+            raise HTTPException(status_code=500, detail="Error calculando similitud")
+
+        # ✅ Enriquecer con picos calculados correctamente si el calculator no los tiene
+        matched_peaks = similarity_score.get("matched_peaks") or peak_match["matched"]
+        unmatched_peaks = similarity_score.get("unmatched_peaks") or peak_match["unmatched"]
+        total_peaks = similarity_score.get("total_peaks") or peak_match["total"]
+        matching_peaks_count = similarity_score.get("matching_peaks_count") or peak_match["matched_count"]
+
+        logger.info(f"✅ Comparación completada: Score={similarity_score.get('global_score', 0):.3f}, "
+                    f"Picos={matching_peaks_count}/{total_peaks}")
+
+        return {
+            "success": True,
+            "message": "Comparación completada",
+            "data": {
+                "global_score": similarity_score.get("global_score", 0),
+                "all_scores": similarity_score.get("all_scores", {
+                    "pearson": 0, "cosine": 0, "euclidean": 0
+                }),
+                "method_used": method,
+                # ✅ Picos en cm⁻¹ reales
+                "matched_peaks": matched_peaks,
+                "unmatched_peaks": unmatched_peaks,
+                "total_peaks": total_peaks,
+                "matching_peaks_count": matching_peaks_count,
+                "query_spectrum": {
+                    "id": query_spectrum.id,
+                    "filename": query_spectrum.filename,
+                    "source": "user_database"
+                },
+                "reference_spectrum": {
+                    "id": reference_spectrum.id,
+                    "filename": reference_spectrum.filename,
+                    "source": "user_database"
+                },
+                "window_scores": similarity_score.get("window_scores", [])
             }
-
-        raise HTTPException(status_code=404, detail="Espectros no encontrados")
+        }
 
     except HTTPException:
         raise
@@ -547,8 +719,7 @@ def compare_spectra(
 
 
 # ========================================
-# ✅ ENDPOINT UNIFICADO - GET SPECTRUM PARA COMPARACIÓN
-# Busca en AMBAS bases de datos con autenticación
+# ENDPOINT UNIFICADO - GET SPECTRUM PARA COMPARACIÓN
 # ========================================
 
 @router.get("/spectrum-for-comparison/{spectrum_id}")
@@ -557,63 +728,68 @@ def get_spectrum_for_comparison(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Obtener espectro para comparación (busca en dataset + usuario DB)"""
+    """
+    ✅ Obtener espectro para comparación (busca en dataset + usuario DB)
+    """
     logger.info(f"🔍 GET /spectrum-for-comparison/{spectrum_id} - Usuario: {current_user.id}")
 
+    connection = None
+    cursor = None
+
     try:
-        # ========================================
-        # INTENTAR DATASET PRIMERO
-        # ========================================
         connection = connect_dataset_db()
         if connection:
-            cursor = connection.cursor()
-            cursor.execute("""
-                SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
-                FROM ftir_spectra fs
-                JOIN zeolite_samples zs ON fs.sample_id = zs.id
-                JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
-                WHERE fs.id = %s
-            """, (spectrum_id,))
+            try:
+                cursor = connection.cursor()
+                cursor.execute("""
+                    SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
+                    FROM ftir_spectra fs
+                    JOIN zeolite_samples zs ON fs.sample_id = zs.id
+                    JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
+                    WHERE fs.id = %s
+                    LIMIT 1
+                """, (spectrum_id,))
 
-            result = cursor.fetchone()
-            cursor.close()
-            connection.close()
+                result = cursor.fetchone()
 
-            if result:
-                logger.info(f"✅ Espectro encontrado en DATASET: {result[2]}")
-                wavenumbers = []
-                intensities = []
-                try:
-                    spectrum_data = json.loads(result[1]) if result[1] else {}
-                    wavenumbers = spectrum_data.get("wavenumbers") or []
-                    intensities = (
-                        spectrum_data.get("intensities")
-                        or spectrum_data.get("absorbance")
-                        or []
-                    )
-                except Exception as e:
-                    logger.warning(f"⚠️ Error parseando spectrum_data del dataset para espectro {spectrum_id}: {e}")
+                if result:
+                    wavenumbers = []
+                    intensities = []
+                    try:
+                        spectrum_data = json.loads(result[1]) if result[1] else {}
+                        wavenumbers = spectrum_data.get("wavenumbers") or []
+                        intensities = (
+                            spectrum_data.get("intensities")
+                            or spectrum_data.get("absorbance")
+                            or []
+                        )
+                    except Exception as e:
+                        logger.warning(f"⚠️ Error parseando spectrum_data: {e}")
 
-                return {
-                    "success": True,
-                    "source": "dataset",
-                    "spectrum": {
-                        "id": result[0],
-                        "filename": result[2],
-                        "family": result[3],
-                        "equipment": result[4] or "N/A",
-                        "spectrum_data": {
-                            "wavenumbers": wavenumbers,
-                            "intensities": intensities
-                        },
-                        "source": "zeolite_dataset"
+                    return {
+                        "success": True,
+                        "source": "dataset",
+                        "spectrum": {
+                            "id": result[0],
+                            "filename": result[2],
+                            "family": result[3],
+                            "equipment": result[4] or "N/A",
+                            "spectrum_data": {
+                                "wavenumbers": wavenumbers,
+                                "intensities": intensities
+                            },
+                            "source": "zeolite_dataset"
+                        }
                     }
-                }
 
-        # ========================================
-        # FALLBACK: Buscar en usuario DB (filtrado por usuario autenticado)
-        # ========================================
-        logger.info(f"⚠️ No en dataset, buscando en usuario DB...")
+            except Exception as e:
+                logger.error(f"❌ Error consultando dataset: {type(e).__name__}: {str(e)}")
+            finally:
+                if cursor:
+                    try:
+                        cursor.close()
+                    except Exception as e:
+                        logger.warning(f"⚠️ Error cerrando cursor: {e}")
 
         spectrum = db.query(Spectrum).filter(
             Spectrum.id == spectrum_id,
@@ -621,11 +797,8 @@ def get_spectrum_for_comparison(
         ).first()
 
         if spectrum:
-            logger.info(f"✅ Espectro encontrado en USER DB: {spectrum.filename}")
-
             wavenumbers = []
             intensities = []
-
             if spectrum.wavenumber_data:
                 try:
                     data = json.loads(spectrum.wavenumber_data)
@@ -636,7 +809,7 @@ def get_spectrum_for_comparison(
                         or []
                     )
                 except Exception as e:
-                    logger.warning(f"⚠️ Error parseando wavenumber_data del usuario para espectro {spectrum_id}: {e}")
+                    logger.warning(f"⚠️ Error parseando wavenumber_data: {e}")
 
             return {
                 "success": True,
@@ -654,17 +827,20 @@ def get_spectrum_for_comparison(
                 }
             }
 
-        # ========================================
-        # NO ENCONTRADO
-        # ========================================
-        logger.warning(f"❌ Espectro {spectrum_id} no encontrado en ninguna BD")
-        raise HTTPException(status_code=404, detail="Espectro no encontrado")
+        raise HTTPException(status_code=404, detail=f"Espectro {spectrum_id} no encontrado")
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    finally:
+        if connection and connection.is_connected():
+            try:
+                connection.close()
+            except Exception as e:
+                logger.warning(f"⚠️ Error cerrando conexión: {e}")
+
 
 # ========================================
 # GET DATASET SPECTRA
@@ -677,22 +853,20 @@ def get_dataset_spectra(
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """
-    ✅ Obtener todos los espectros del dataset
-    Útil para ver la biblioteca completa
-    """
+    """✅ Obtener todos los espectros del dataset"""
+    connection = None
+    cursor = None
+
     try:
         connection = connect_dataset_db()
         if not connection:
             raise HTTPException(status_code=500, detail="No se pudo conectar al dataset")
 
         cursor = connection.cursor()
-
-        # Contar total
         cursor.execute("SELECT COUNT(*) FROM ftir_spectra")
-        total = cursor.fetchone()[0]
+        total_result = cursor.fetchone()
+        total = total_result[0] if total_result else 0
 
-        # Obtener espectros
         cursor.execute("""
             SELECT fs.id, zs.sample_code, zt.name, fs.equipment, fs.measurement_date, fs.spectrum_data
             FROM ftir_spectra fs
@@ -703,14 +877,13 @@ def get_dataset_spectra(
         """, (limit, skip))
 
         results = cursor.fetchall()
-        cursor.close()
-        connection.close()
-
         spectra = []
+
         for result in results:
             try:
-                spectrum_data = json.loads(result[5])
-            except:
+                spectrum_data = json.loads(result[5]) if result[5] else {}
+            except Exception as e:
+                logger.warning(f"⚠️ Error parseando espectro {result[0]}: {e}")
                 spectrum_data = {}
 
             spectra.append({
@@ -727,16 +900,23 @@ def get_dataset_spectra(
             "success": True,
             "data": spectra,
             "total": total,
-            "pagination": {
-                "skip": skip,
-                "limit": limit,
-                "total": total
-            }
+            "pagination": {"skip": skip, "limit": limit, "total": total}
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error obteniendo dataset: {e}")
+        logger.error(f"❌ Error obteniendo dataset: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception: pass
+        if connection and connection.is_connected():
+            try:
+                connection.close()
+            except Exception: pass
 
 
 # ========================================
@@ -745,18 +925,16 @@ def get_dataset_spectra(
 
 @router.get("/spectrum/{spectrum_id}")
 def get_spectrum_info(spectrum_id: int):
-    """
-    ✅ Obtener espectro del dataset
-    Maneja correctamente cuando no existe
-    """
+    """✅ Obtener espectro del dataset"""
+    connection = None
+    cursor = None
+
     try:
-        # Primero verificar si existe
         connection = connect_dataset_db()
         if not connection:
             raise HTTPException(status_code=500, detail="No se pudo conectar a la base de datos")
 
         cursor = connection.cursor()
-
         cursor.execute("""
             SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
             FROM ftir_spectra fs
@@ -767,16 +945,13 @@ def get_spectrum_info(spectrum_id: int):
         """, (spectrum_id,))
 
         result = cursor.fetchone()
-        cursor.close()
-        connection.close()
 
         if not result:
-            logger.warning(f"⚠️ Espectro {spectrum_id} no encontrado en dataset")
             raise HTTPException(status_code=404, detail=f"Espectro {spectrum_id} no existe en el dataset")
 
         try:
-            spectrum_data = json.loads(result[1])
-        except:
+            spectrum_data = json.loads(result[1]) if result[1] else {}
+        except Exception as e:
             spectrum_data = {"error": "No se pudo procesar los datos"}
 
         return {
@@ -794,5 +969,14 @@ def get_spectrum_info(spectrum_id: int):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error obteniendo espectro: {e}")
+        logger.error(f"❌ Error obteniendo espectro: {type(e).__name__}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception: pass
+        if connection and connection.is_connected():
+            try:
+                connection.close()
+            except Exception: pass
