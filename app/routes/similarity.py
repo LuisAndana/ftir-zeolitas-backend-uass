@@ -1259,10 +1259,39 @@ def get_dataset_spectra(
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """✅ Obtener todos los espectros del dataset"""
+    """
+    Obtener metadatos de los espectros del dataset.
+    Sirve desde el cache en RAM cuando está disponible (instantáneo).
+    spectrum_data se omite en el listado; usar GET /spectrum/{id} para datos completos.
+    """
+    # ── Camino rápido: cache en RAM ya disponible ──────────────────────
+    if dataset_matrix_cache.loaded:
+        all_meta = dataset_matrix_cache.metadata
+        total = len(all_meta)
+        page = all_meta[skip: skip + limit]
+        spectra = [
+            {
+                "id": m["spectrum_id"],
+                "sample_code": m["sample_code"],
+                "zeolite_name": m["zeolite_name"],
+                "equipment": m["equipment"],
+                "measurement_date": m["measurement_date"],
+                "filename": f"{m['sample_code']} ({m['zeolite_name']})",
+                "spectrum_data": {},          # carga bajo demanda con /spectrum/{id}
+            }
+            for m in page
+        ]
+        return {
+            "success": True,
+            "data": spectra,
+            "total": total,
+            "pagination": {"skip": skip, "limit": limit, "total": total},
+            "source": "cache",
+        }
+
+    # ── Camino lento: cache no listo → consulta BD solo metadatos ──────
     connection = None
     cursor = None
-
     try:
         connection = connect_dataset_db()
         if not connection:
@@ -1270,11 +1299,11 @@ def get_dataset_spectra(
 
         cursor = connection.cursor()
         cursor.execute("SELECT COUNT(*) FROM ftir_spectra")
-        total_result = cursor.fetchone()
-        total = total_result[0] if total_result else 0
+        total = (cursor.fetchone() or [0])[0]
 
+        # SIN spectrum_data para evitar transferir cientos de MB
         cursor.execute("""
-            SELECT fs.id, zs.sample_code, zt.name, fs.equipment, fs.measurement_date, fs.spectrum_data
+            SELECT fs.id, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
             FROM ftir_spectra fs
             JOIN zeolite_samples zs ON fs.sample_id = zs.id
             JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
@@ -1282,47 +1311,39 @@ def get_dataset_spectra(
             LIMIT %s OFFSET %s
         """, (limit, skip))
 
-        results = cursor.fetchall()
-        spectra = []
-
-        for result in results:
-            try:
-                spectrum_data = json.loads(result[5]) if result[5] else {}
-            except Exception as e:
-                logger.warning(f"⚠️ Error parseando espectro {result[0]}: {e}")
-                spectrum_data = {}
-
-            spectra.append({
-                "id": result[0],
-                "sample_code": result[1],
-                "zeolite_name": result[2],
-                "equipment": result[3],
-                "measurement_date": str(result[4]) if result[4] else None,
-                "filename": f"{result[1]} ({result[2]})",
-                "spectrum_data": spectrum_data
-            })
+        spectra = [
+            {
+                "id": r[0],
+                "sample_code": r[1],
+                "zeolite_name": r[2],
+                "equipment": r[3],
+                "measurement_date": str(r[4]) if r[4] else None,
+                "filename": f"{r[1]} ({r[2]})",
+                "spectrum_data": {},
+            }
+            for r in cursor.fetchall()
+        ]
 
         return {
             "success": True,
             "data": spectra,
             "total": total,
-            "pagination": {"skip": skip, "limit": limit, "total": total}
+            "pagination": {"skip": skip, "limit": limit, "total": total},
+            "source": "database",
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error obteniendo dataset: {type(e).__name__}: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error obteniendo dataset: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if cursor:
-            try:
-                cursor.close()
-            except Exception: pass
+            try: cursor.close()
+            except: pass
         if connection and connection.is_connected():
-            try:
-                connection.close()
-            except Exception: pass
+            try: connection.close()
+            except: pass
 
 
 # ========================================
@@ -1330,8 +1351,32 @@ def get_dataset_spectra(
 # ========================================
 
 @router.get("/spectrum/{spectrum_id}")
-def get_spectrum_info(spectrum_id: int):
-    """✅ Obtener espectro del dataset"""
+def get_spectrum_info(spectrum_id: int, current_user: User = Depends(get_current_user)):
+    """
+    Obtener datos completos de un espectro del dataset.
+    Sirve desde cache en RAM cuando disponible (sin BD); recae en BD si no.
+    """
+    # Camino rápido: buscar en el cache por spectrum_id
+    if dataset_matrix_cache.loaded:
+        for i, meta in enumerate(dataset_matrix_cache.metadata):
+            if meta["spectrum_id"] == spectrum_id:
+                return {
+                    "success": True,
+                    "spectrum": {
+                        "id": spectrum_id,
+                        "spectrum_data": {
+                            "wavenumbers": FIXED_GRID.tolist(),
+                            "intensities": dataset_matrix_cache.matrix[i].tolist(),
+                        },
+                        "sample_code": meta["sample_code"],
+                        "zeolite_name": meta["zeolite_name"],
+                        "equipment": meta["equipment"],
+                        "measurement_date": meta["measurement_date"],
+                    },
+                    "source": "cache",
+                }
+
+    # Camino BD (fallback)
     connection = None
     cursor = None
 
