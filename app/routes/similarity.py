@@ -86,8 +86,14 @@ FIXED_GRID = np.linspace(400, 4000, 1801, dtype=np.float32)
 class DatasetMatrixCache:
     """
     Cache vectorial del dataset completo.
-    - Al cargar: interpola todos los espectros al FIXED_GRID, normaliza, precomputa norms/means/stds/picos.
-    - Al buscar: interpola el query al mismo grid → dot product matricial O(N*L) con numpy → <10ms.
+
+    Fase de carga (background, ~3-5s):
+      - Parsea JSON + interpola al FIXED_GRID en paralelo (ThreadPoolExecutor).
+      - NO pre-computa picos → loaded=True en cuanto la matriz está lista.
+
+    Fase de búsqueda (<30ms):
+      - Una sola operación matricial numpy para las similitudes de los N espectros.
+      - Calcula picos solo para los top_n resultados finales (no para los 5000).
     """
 
     def __init__(self):
@@ -95,8 +101,7 @@ class DatasetMatrixCache:
         self.norms: Optional[np.ndarray] = None      # (N,) para cosine
         self.means: Optional[np.ndarray] = None      # (N,) para pearson
         self.stds: Optional[np.ndarray] = None       # (N,) para pearson
-        self.metadata: List[Dict] = []               # id, sample_code, zeolite_name, equipment, date
-        self.peaks: List[List[float]] = []           # picos pre-calculados por espectro
+        self.metadata: List[Dict] = []
         self.loaded: bool = False
         self.loading: bool = False
         self.lock = Lock()
@@ -124,8 +129,44 @@ class DatasetMatrixCache:
         except Exception:
             return None
 
+    def _process_row(self, row) -> Optional[tuple]:
+        """Procesa una fila del dataset: parsea JSON, interpola, normaliza."""
+        try:
+            spec_data = json.loads(row[1]) if row[1] else {}
+            wn = np.array(spec_data.get("wavenumbers") or [], dtype=np.float32)
+            ab = np.array(
+                spec_data.get("intensities") or spec_data.get("absorbance") or [],
+                dtype=np.float32
+            )
+            if len(wn) < 2 or len(ab) < 2:
+                return None
+
+            interp_vec = self._interpolate_to_grid(wn, ab)
+            if interp_vec is None:
+                return None
+
+            mn, mx = float(np.min(interp_vec)), float(np.max(interp_vec))
+            if mx - mn < 1e-10:
+                return None
+
+            norm_vec = ((interp_vec - mn) / (mx - mn)).astype(np.float32)
+            meta = {
+                "spectrum_id": int(row[0]),
+                "sample_code": row[2],
+                "zeolite_name": row[3],
+                "equipment": row[4],
+                "measurement_date": str(row[5]) if row[5] else "N/A",
+            }
+            return (norm_vec, meta)
+        except Exception as e:
+            logger.debug(f"DatasetMatrixCache: skip espectro {row[0]}: {e}")
+            return None
+
     def load(self) -> bool:
-        """Carga todo el dataset en RAM. Thread-safe; evita cargas concurrentes."""
+        """
+        Carga todo el dataset en RAM usando ThreadPoolExecutor.
+        No pre-computa picos → loaded=True en cuanto la matriz está lista (~3-5s).
+        """
         with self.lock:
             if self.loaded or self.loading:
                 return self.loaded
@@ -153,66 +194,35 @@ class DatasetMatrixCache:
                 logger.warning("DatasetMatrixCache: dataset vacío")
                 return False
 
-            logger.info(f"DatasetMatrixCache: procesando {len(rows)} espectros...")
+            logger.info(f"DatasetMatrixCache: procesando {len(rows)} espectros en paralelo...")
 
-            matrix_rows, metadata, peaks_list = [], [], []
+            # Procesar filas en paralelo (JSON parse + interpolación)
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                processed = list(executor.map(self._process_row, rows))
 
-            for row in rows:
-                try:
-                    spec_data = json.loads(row[1]) if row[1] else {}
-                    wn = np.array(spec_data.get("wavenumbers") or [], dtype=np.float32)
-                    ab = np.array(
-                        spec_data.get("intensities") or spec_data.get("absorbance") or [],
-                        dtype=np.float32
-                    )
-                    if len(wn) < 2 or len(ab) < 2:
-                        continue
+            valid = [r for r in processed if r is not None]
 
-                    interp_vec = self._interpolate_to_grid(wn, ab)
-                    if interp_vec is None:
-                        continue
-
-                    mn, mx = np.min(interp_vec), np.max(interp_vec)
-                    if mx - mn < 1e-10:
-                        continue
-                    norm_vec = (interp_vec - mn) / (mx - mn)
-
-                    pks = detect_peaks_vectorized(FIXED_GRID, norm_vec, threshold=0.05)
-
-                    matrix_rows.append(norm_vec)
-                    metadata.append({
-                        "spectrum_id": int(row[0]),
-                        "sample_code": row[2],
-                        "zeolite_name": row[3],
-                        "equipment": row[4],
-                        "measurement_date": str(row[5]) if row[5] else "N/A",
-                    })
-                    peaks_list.append(pks)
-                except Exception as e:
-                    logger.debug(f"DatasetMatrixCache: skip espectro {row[0]}: {e}")
-                    continue
-
-            if not matrix_rows:
+            if not valid:
                 logger.warning("DatasetMatrixCache: ningún espectro válido")
                 return False
 
-            mat = np.array(matrix_rows, dtype=np.float32)         # (N, L)
+            mat = np.array([r[0] for r in valid], dtype=np.float32)   # (N, L)
+            metadata = [r[1] for r in valid]
 
             with self.lock:
                 self.matrix = mat
-                self.norms = np.linalg.norm(mat, axis=1)           # (N,)
-                self.means = np.mean(mat, axis=1)                   # (N,)
-                self.stds = np.std(mat, axis=1)                    # (N,)
+                self.norms = np.linalg.norm(mat, axis=1)
+                self.means = np.mean(mat, axis=1)
+                self.stds = np.std(mat, axis=1)
                 self.metadata = metadata
-                self.peaks = peaks_list
-                self.total_loaded = len(matrix_rows)
+                self.total_loaded = len(valid)
                 self.load_time = datetime.now()
                 self.loaded = True
                 self.loading = False
 
             elapsed = time.time() - t0
             logger.info(
-                f"DatasetMatrixCache: {self.total_loaded} espectros cargados en {elapsed:.2f}s "
+                f"DatasetMatrixCache: {self.total_loaded} espectros listos en {elapsed:.2f}s "
                 f"({mat.nbytes / 1024 / 1024:.1f} MB RAM)"
             )
             return True
@@ -241,10 +251,9 @@ class DatasetMatrixCache:
         family_filter: Optional[str] = None,
     ) -> List[Dict]:
         """
-        Búsqueda vectorizada instantánea.
-        1. Interpola el query al FIXED_GRID.
-        2. Una sola operación matricial para todas las similitudes.
-        3. Filtra + ordena + retorna top_n.
+        1. Interpola query al FIXED_GRID.
+        2. Una operación matricial → similitudes para todos los N espectros.
+        3. Calcula picos solo para los top_n candidatos finales.
         """
         if not self.loaded or self.matrix is None:
             return []
@@ -252,12 +261,10 @@ class DatasetMatrixCache:
         interp = self._interpolate_to_grid(query_wn, query_ab)
         if interp is None:
             return []
-        mn, mx = np.min(interp), np.max(interp)
+        mn, mx = float(np.min(interp)), float(np.max(interp))
         if mx - mn < 1e-10:
             return []
-        query_norm = (interp - mn) / (mx - mn)
-
-        query_peaks = detect_peaks_vectorized(FIXED_GRID, query_norm, threshold=0.05)
+        query_norm = ((interp - mn) / (mx - mn)).astype(np.float32)
 
         L = len(FIXED_GRID)
 
@@ -285,6 +292,7 @@ class DatasetMatrixCache:
         else:
             return []
 
+        # Filtrar por similitud mínima y familia
         mask = sims >= min_similarity
         if family_filter:
             family_mask = np.array([m["zeolite_name"] == family_filter for m in self.metadata])
@@ -294,11 +302,15 @@ class DatasetMatrixCache:
         if len(valid_idx) == 0:
             return []
 
+        # Ordenar y tomar top_n
         sorted_idx = valid_idx[np.argsort(sims[valid_idx])[::-1]][:top_n]
 
+        # Calcular picos solo para los top_n resultados (no para los 5000)
+        query_peaks = detect_peaks_vectorized(FIXED_GRID, query_norm, threshold=0.05)
         results = []
         for idx in sorted_idx:
-            peak_match = match_peaks_vectorized(query_peaks, self.peaks[idx], tolerance)
+            spec_peaks = detect_peaks_vectorized(FIXED_GRID, self.matrix[idx], threshold=0.05)
+            peak_match = match_peaks_vectorized(query_peaks, spec_peaks, tolerance)
             results.append({
                 **self.metadata[idx],
                 "similarity": float(sims[idx]),
