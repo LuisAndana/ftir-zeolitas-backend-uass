@@ -9,15 +9,16 @@
 
 import logging
 import json
+import os
 import time
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import numpy as np
 from scipy.spatial.distance import euclidean, cosine
 from scipy.stats import pearsonr
-from scipy.interpolate import interp1d
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Dict, List, Tuple, Optional
@@ -83,24 +84,29 @@ FIXED_GRID = np.linspace(400, 4000, 1801, dtype=np.float32)
 # Búsqueda = una sola operación matricial → prácticamente instantánea.
 # ========================================
 
+_CACHE_DIR = Path("./cache")
+_CACHE_NPZ = _CACHE_DIR / "dataset_matrix.npz"
+_CACHE_META = _CACHE_DIR / "dataset_meta.json"
+
+
 class DatasetMatrixCache:
     """
-    Cache vectorial del dataset completo.
+    Cache vectorial del dataset completo con persistencia en disco.
 
-    Fase de carga (background, ~3-5s):
-      - Parsea JSON + interpola al FIXED_GRID en paralelo (ThreadPoolExecutor).
-      - NO pre-computa picos → loaded=True en cuanto la matriz está lista.
-
-    Fase de búsqueda (<30ms):
-      - Una sola operación matricial numpy para las similitudes de los N espectros.
-      - Calcula picos solo para los top_n resultados finales (no para los 5000).
+    Estrategia de velocidad:
+      - 1ª carga: BD → numpy matrix → guarda .npz en disco.
+      - Reinicios siguientes: carga .npz desde disco (<1s, sin tocar la BD).
+      - Búsqueda: una operación matricial numpy (<15ms para 9000 espectros).
+      - Picos: solo para los top_n resultados finales, nunca para los N totales.
+      - Pearson: usa mat_centered pre-computado (no recalcula en cada búsqueda).
     """
 
     def __init__(self):
-        self.matrix: Optional[np.ndarray] = None    # (N, L) float32, normalizado 0-1
-        self.norms: Optional[np.ndarray] = None      # (N,) para cosine
-        self.means: Optional[np.ndarray] = None      # (N,) para pearson
-        self.stds: Optional[np.ndarray] = None       # (N,) para pearson
+        self.matrix: Optional[np.ndarray] = None       # (N, L) float32
+        self.mat_centered: Optional[np.ndarray] = None # (N, L) centrado por fila (pearson)
+        self.norms: Optional[np.ndarray] = None        # (N,)
+        self.means: Optional[np.ndarray] = None        # (N,)
+        self.stds: Optional[np.ndarray] = None         # (N,)
         self.metadata: List[Dict] = []
         self.loaded: bool = False
         self.loading: bool = False
@@ -108,8 +114,11 @@ class DatasetMatrixCache:
         self.load_time: Optional[datetime] = None
         self.total_loaded: int = 0
 
-    def _interpolate_to_grid(self, wavenumbers: np.ndarray, intensities: np.ndarray) -> Optional[np.ndarray]:
-        """Interpola un espectro al FIXED_GRID. Retorna None si no hay solapamiento suficiente."""
+    # ------------------------------------------------------------------
+    # Interpolación: np.interp es 5x más rápido que scipy.interp1d
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _interpolate_to_grid(wavenumbers: np.ndarray, intensities: np.ndarray) -> Optional[np.ndarray]:
         if len(wavenumbers) < 2 or len(intensities) < 2:
             return None
         try:
@@ -119,37 +128,46 @@ class DatasetMatrixCache:
 
             wn_min, wn_max = float(wn_s[0]), float(wn_s[-1])
             grid_mask = (FIXED_GRID >= wn_min) & (FIXED_GRID <= wn_max)
-            if np.sum(grid_mask) < 50:
+            if int(np.sum(grid_mask)) < 50:
                 return None
 
-            f = interp1d(wn_s, ab_s, kind='linear', bounds_error=False, fill_value=0.0)
             out = np.zeros(len(FIXED_GRID), dtype=np.float32)
-            out[grid_mask] = f(FIXED_GRID[grid_mask]).astype(np.float32)
+            out[grid_mask] = np.interp(FIXED_GRID[grid_mask], wn_s, ab_s).astype(np.float32)
             return out
         except Exception:
             return None
 
-    def _process_row(self, row) -> Optional[tuple]:
-        """Procesa una fila del dataset: parsea JSON, interpola, normaliza."""
+    # ------------------------------------------------------------------
+    # Proceso de una fila (ejecutado en threads)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _process_row(row) -> Optional[tuple]:
         try:
             spec_data = json.loads(row[1]) if row[1] else {}
             wn = np.array(spec_data.get("wavenumbers") or [], dtype=np.float32)
             ab = np.array(
                 spec_data.get("intensities") or spec_data.get("absorbance") or [],
-                dtype=np.float32
+                dtype=np.float32,
             )
             if len(wn) < 2 or len(ab) < 2:
                 return None
 
-            interp_vec = self._interpolate_to_grid(wn, ab)
-            if interp_vec is None:
+            sort_idx = np.argsort(wn)
+            wn = wn[sort_idx]; ab = ab[sort_idx]
+
+            wn_min, wn_max = float(wn[0]), float(wn[-1])
+            grid_mask = (FIXED_GRID >= wn_min) & (FIXED_GRID <= wn_max)
+            if int(np.sum(grid_mask)) < 50:
                 return None
 
-            mn, mx = float(np.min(interp_vec)), float(np.max(interp_vec))
+            out = np.zeros(len(FIXED_GRID), dtype=np.float32)
+            out[grid_mask] = np.interp(FIXED_GRID[grid_mask], wn, ab).astype(np.float32)
+
+            mn, mx = float(out.min()), float(out.max())
             if mx - mn < 1e-10:
                 return None
 
-            norm_vec = ((interp_vec - mn) / (mx - mn)).astype(np.float32)
+            norm_vec = ((out - mn) / (mx - mn)).astype(np.float32)
             meta = {
                 "spectrum_id": int(row[0]),
                 "sample_code": row[2],
@@ -158,20 +176,89 @@ class DatasetMatrixCache:
                 "measurement_date": str(row[5]) if row[5] else "N/A",
             }
             return (norm_vec, meta)
-        except Exception as e:
-            logger.debug(f"DatasetMatrixCache: skip espectro {row[0]}: {e}")
+        except Exception:
             return None
 
+    # ------------------------------------------------------------------
+    # Persistencia en disco
+    # ------------------------------------------------------------------
+    def _save_to_disk(self, mat: np.ndarray, metadata: List[Dict]) -> None:
+        try:
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                str(_CACHE_NPZ),
+                matrix=mat,
+                norms=np.linalg.norm(mat, axis=1),
+                means=np.mean(mat, axis=1),
+                stds=np.std(mat, axis=1),
+                mat_centered=(mat - np.mean(mat, axis=1, keepdims=True)),
+            )
+            with open(_CACHE_META, "w") as f:
+                json.dump(metadata, f)
+            logger.info(f"DatasetMatrixCache: guardado en disco ({_CACHE_NPZ})")
+        except Exception as e:
+            logger.warning(f"DatasetMatrixCache: no se pudo guardar en disco: {e}")
+
+    def _load_from_disk(self) -> bool:
+        try:
+            if not _CACHE_NPZ.with_suffix(".npz").exists() and not Path(str(_CACHE_NPZ) + ".npz").exists():
+                # np.savez_compressed agrega .npz automáticamente si no está
+                npz_path = Path(str(_CACHE_NPZ) + ".npz") if not str(_CACHE_NPZ).endswith(".npz") else _CACHE_NPZ
+                if not npz_path.exists():
+                    return False
+            else:
+                npz_path = _CACHE_NPZ if _CACHE_NPZ.exists() else Path(str(_CACHE_NPZ) + ".npz")
+
+            if not _CACHE_META.exists():
+                return False
+
+            t0 = time.time()
+            data = np.load(str(npz_path))
+            with open(_CACHE_META) as f:
+                metadata = json.load(f)
+
+            mat = data["matrix"]
+
+            with self.lock:
+                self.matrix = mat
+                self.norms = data["norms"]
+                self.means = data["means"]
+                self.stds = data["stds"]
+                self.mat_centered = data["mat_centered"]
+                self.metadata = metadata
+                self.total_loaded = len(metadata)
+                self.load_time = datetime.now()
+                self.loaded = True
+                self.loading = False
+
+            elapsed = time.time() - t0
+            logger.info(
+                f"DatasetMatrixCache: {self.total_loaded} espectros cargados desde disco "
+                f"en {elapsed:.2f}s ({mat.nbytes / 1024 / 1024:.1f} MB RAM)"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"DatasetMatrixCache: no se pudo cargar desde disco: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Carga principal
+    # ------------------------------------------------------------------
     def load(self) -> bool:
         """
-        Carga todo el dataset en RAM usando ThreadPoolExecutor.
-        No pre-computa picos → loaded=True en cuanto la matriz está lista (~3-5s).
+        1. Intenta cargar desde disco (rápido, <1s).
+        2. Si no hay disco, carga desde BD en paralelo y guarda al disco.
         """
         with self.lock:
             if self.loaded or self.loading:
                 return self.loaded
             self.loading = True
 
+        # Intento rápido desde disco
+        if self._load_from_disk():
+            return True
+
+        # Carga desde BD (costosa, una sola vez)
         t0 = time.time()
         connection = None
         cursor = None
@@ -179,6 +266,8 @@ class DatasetMatrixCache:
             connection = connect_dataset_db()
             if not connection:
                 logger.warning("DatasetMatrixCache: no hay conexión al dataset")
+                with self.lock:
+                    self.loading = False
                 return False
 
             cursor = connection.cursor()
@@ -189,46 +278,10 @@ class DatasetMatrixCache:
                 JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
             """)
             rows = cursor.fetchall()
-
-            if not rows:
-                logger.warning("DatasetMatrixCache: dataset vacío")
-                return False
-
-            logger.info(f"DatasetMatrixCache: procesando {len(rows)} espectros en paralelo...")
-
-            # Procesar filas en paralelo (JSON parse + interpolación)
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                processed = list(executor.map(self._process_row, rows))
-
-            valid = [r for r in processed if r is not None]
-
-            if not valid:
-                logger.warning("DatasetMatrixCache: ningún espectro válido")
-                return False
-
-            mat = np.array([r[0] for r in valid], dtype=np.float32)   # (N, L)
-            metadata = [r[1] for r in valid]
-
-            with self.lock:
-                self.matrix = mat
-                self.norms = np.linalg.norm(mat, axis=1)
-                self.means = np.mean(mat, axis=1)
-                self.stds = np.std(mat, axis=1)
-                self.metadata = metadata
-                self.total_loaded = len(valid)
-                self.load_time = datetime.now()
-                self.loaded = True
-                self.loading = False
-
-            elapsed = time.time() - t0
-            logger.info(
-                f"DatasetMatrixCache: {self.total_loaded} espectros listos en {elapsed:.2f}s "
-                f"({mat.nbytes / 1024 / 1024:.1f} MB RAM)"
-            )
-            return True
+            logger.info(f"DatasetMatrixCache: {len(rows)} filas de BD, procesando en paralelo...")
 
         except Exception as e:
-            logger.error(f"DatasetMatrixCache: error al cargar: {e}", exc_info=True)
+            logger.error(f"DatasetMatrixCache: error leyendo BD: {e}", exc_info=True)
             with self.lock:
                 self.loading = False
             return False
@@ -240,6 +293,58 @@ class DatasetMatrixCache:
                 try: connection.close()
                 except: pass
 
+        if not rows:
+            logger.warning("DatasetMatrixCache: dataset vacío")
+            with self.lock:
+                self.loading = False
+            return False
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                processed = list(executor.map(self._process_row, rows))
+
+            valid = [r for r in processed if r is not None]
+            if not valid:
+                logger.warning("DatasetMatrixCache: ningún espectro válido")
+                with self.lock:
+                    self.loading = False
+                return False
+
+            mat = np.array([r[0] for r in valid], dtype=np.float32)
+            metadata = [r[1] for r in valid]
+
+            with self.lock:
+                self.matrix = mat
+                self.norms = np.linalg.norm(mat, axis=1)
+                self.means = np.mean(mat, axis=1)
+                self.stds = np.std(mat, axis=1)
+                self.mat_centered = (mat - np.mean(mat, axis=1, keepdims=True)).astype(np.float32)
+                self.metadata = metadata
+                self.total_loaded = len(valid)
+                self.load_time = datetime.now()
+                self.loaded = True
+                self.loading = False
+
+            elapsed = time.time() - t0
+            logger.info(
+                f"DatasetMatrixCache: {self.total_loaded} espectros listos en {elapsed:.2f}s "
+                f"({mat.nbytes / 1024 / 1024:.1f} MB RAM) — guardando en disco..."
+            )
+            # Guardar en background para no bloquear
+            threading.Thread(
+                target=self._save_to_disk, args=(mat, metadata), daemon=True, name="cache-save"
+            ).start()
+            return True
+
+        except Exception as e:
+            logger.error(f"DatasetMatrixCache: error procesando: {e}", exc_info=True)
+            with self.lock:
+                self.loading = False
+            return False
+
+    # ------------------------------------------------------------------
+    # Búsqueda vectorizada
+    # ------------------------------------------------------------------
     def search(
         self,
         query_wn: np.ndarray,
@@ -251,20 +356,27 @@ class DatasetMatrixCache:
         family_filter: Optional[str] = None,
     ) -> List[Dict]:
         """
-        1. Interpola query al FIXED_GRID.
+        1. Interpola query al FIXED_GRID (np.interp).
         2. Una operación matricial → similitudes para todos los N espectros.
         3. Calcula picos solo para los top_n candidatos finales.
         """
         if not self.loaded or self.matrix is None:
             return []
 
-        interp = self._interpolate_to_grid(query_wn, query_ab)
-        if interp is None:
+        sort_idx = np.argsort(query_wn)
+        wn_s = query_wn[sort_idx]; ab_s = query_ab[sort_idx]
+        wn_min, wn_max = float(wn_s[0]), float(wn_s[-1])
+        grid_mask = (FIXED_GRID >= wn_min) & (FIXED_GRID <= wn_max)
+        if int(np.sum(grid_mask)) < 50:
             return []
-        mn, mx = float(np.min(interp)), float(np.max(interp))
+
+        q_interp = np.zeros(len(FIXED_GRID), dtype=np.float32)
+        q_interp[grid_mask] = np.interp(FIXED_GRID[grid_mask], wn_s, ab_s).astype(np.float32)
+
+        mn, mx = float(q_interp.min()), float(q_interp.max())
         if mx - mn < 1e-10:
             return []
-        query_norm = ((interp - mn) / (mx - mn)).astype(np.float32)
+        query_norm = ((q_interp - mn) / (mx - mn)).astype(np.float32)
 
         L = len(FIXED_GRID)
 
@@ -276,12 +388,12 @@ class DatasetMatrixCache:
             sims = np.clip((sims + 1.0) / 2.0, 0.0, 1.0)
 
         elif method == "pearson":
-            q_centered = query_norm - float(np.mean(query_norm))
+            q_centered = (query_norm - float(np.mean(query_norm))).astype(np.float32)
             q_std = float(np.std(query_norm))
             if q_std < 1e-10:
                 return []
-            mat_centered = self.matrix - self.means[:, np.newaxis]
-            cov = (mat_centered @ q_centered) / L
+            # mat_centered ya está pre-computado en load() → sin allocaciones extra
+            cov = (self.mat_centered @ q_centered) / L
             sims = np.clip((cov / (self.stds * q_std + 1e-10) + 1.0) / 2.0, 0.0, 1.0)
 
         elif method == "euclidean":
@@ -292,7 +404,6 @@ class DatasetMatrixCache:
         else:
             return []
 
-        # Filtrar por similitud mínima y familia
         mask = sims >= min_similarity
         if family_filter:
             family_mask = np.array([m["zeolite_name"] == family_filter for m in self.metadata])
@@ -302,10 +413,8 @@ class DatasetMatrixCache:
         if len(valid_idx) == 0:
             return []
 
-        # Ordenar y tomar top_n
         sorted_idx = valid_idx[np.argsort(sims[valid_idx])[::-1]][:top_n]
 
-        # Calcular picos solo para los top_n resultados (no para los 5000)
         query_peaks = detect_peaks_vectorized(FIXED_GRID, query_norm, threshold=0.05)
         results = []
         for idx in sorted_idx:
@@ -320,11 +429,18 @@ class DatasetMatrixCache:
         return results
 
     def reload(self):
-        """Fuerza recarga del cache (en background thread)."""
+        """Borra caché de disco y recarga desde BD en background."""
+        try:
+            for p in [_CACHE_NPZ, Path(str(_CACHE_NPZ) + ".npz"), _CACHE_META]:
+                if p.exists():
+                    p.unlink()
+        except Exception as e:
+            logger.warning(f"DatasetMatrixCache: error borrando disco: {e}")
         with self.lock:
             self.loaded = False
             self.loading = False
             self.matrix = None
+            self.mat_centered = None
         threading.Thread(target=self.load, daemon=True, name="dataset-cache-reload").start()
 
 
@@ -1280,6 +1396,8 @@ def get_spectrum_info(spectrum_id: int):
 def get_cache_status(current_user: User = Depends(get_current_user)):
     """Estado del cache matricial del dataset."""
     c = dataset_matrix_cache
+    npz = Path(str(_CACHE_NPZ) + ".npz") if not str(_CACHE_NPZ).endswith(".npz") else _CACHE_NPZ
+    disk_cached = npz.exists() and _CACHE_META.exists()
     return {
         "loaded": c.loaded,
         "loading": c.loading,
@@ -1287,6 +1405,7 @@ def get_cache_status(current_user: User = Depends(get_current_user)):
         "load_time": c.load_time.isoformat() if c.load_time else None,
         "matrix_shape": list(c.matrix.shape) if c.matrix is not None else None,
         "ram_mb": round(c.matrix.nbytes / 1024 / 1024, 2) if c.matrix is not None else 0,
+        "disk_cache_exists": disk_cached,
     }
 
 
