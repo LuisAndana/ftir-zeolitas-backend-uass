@@ -10,12 +10,14 @@
 import logging
 import json
 import time
+import threading
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import numpy as np
 from scipy.spatial.distance import euclidean, cosine
 from scipy.stats import pearsonr
+from scipy.interpolate import interp1d
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Dict, List, Tuple, Optional
@@ -67,6 +69,254 @@ class SpectrumCache:
                          if now - v[1] < self.ttl}
 
 spectrum_cache = SpectrumCache(ttl_minutes=60)
+
+# ========================================
+# GRID FIJO PARA INTERPOLACIÓN
+# ========================================
+
+# Grid fijo: 400-4000 cm⁻¹ con paso de 2 cm⁻¹ → 1801 puntos
+FIXED_GRID = np.linspace(400, 4000, 1801, dtype=np.float32)
+
+# ========================================
+# CACHE MATRICIAL DEL DATASET (PRELOADED)
+# Carga todo el dataset en RAM como matriz numpy normalizada.
+# Búsqueda = una sola operación matricial → prácticamente instantánea.
+# ========================================
+
+class DatasetMatrixCache:
+    """
+    Cache vectorial del dataset completo.
+    - Al cargar: interpola todos los espectros al FIXED_GRID, normaliza, precomputa norms/means/stds/picos.
+    - Al buscar: interpola el query al mismo grid → dot product matricial O(N*L) con numpy → <10ms.
+    """
+
+    def __init__(self):
+        self.matrix: Optional[np.ndarray] = None    # (N, L) float32, normalizado 0-1
+        self.norms: Optional[np.ndarray] = None      # (N,) para cosine
+        self.means: Optional[np.ndarray] = None      # (N,) para pearson
+        self.stds: Optional[np.ndarray] = None       # (N,) para pearson
+        self.metadata: List[Dict] = []               # id, sample_code, zeolite_name, equipment, date
+        self.peaks: List[List[float]] = []           # picos pre-calculados por espectro
+        self.loaded: bool = False
+        self.loading: bool = False
+        self.lock = Lock()
+        self.load_time: Optional[datetime] = None
+        self.total_loaded: int = 0
+
+    def _interpolate_to_grid(self, wavenumbers: np.ndarray, intensities: np.ndarray) -> Optional[np.ndarray]:
+        """Interpola un espectro al FIXED_GRID. Retorna None si no hay solapamiento suficiente."""
+        if len(wavenumbers) < 2 or len(intensities) < 2:
+            return None
+        try:
+            sort_idx = np.argsort(wavenumbers)
+            wn_s = wavenumbers[sort_idx]
+            ab_s = intensities[sort_idx]
+
+            wn_min, wn_max = float(wn_s[0]), float(wn_s[-1])
+            grid_mask = (FIXED_GRID >= wn_min) & (FIXED_GRID <= wn_max)
+            if np.sum(grid_mask) < 50:
+                return None
+
+            f = interp1d(wn_s, ab_s, kind='linear', bounds_error=False, fill_value=0.0)
+            out = np.zeros(len(FIXED_GRID), dtype=np.float32)
+            out[grid_mask] = f(FIXED_GRID[grid_mask]).astype(np.float32)
+            return out
+        except Exception:
+            return None
+
+    def load(self) -> bool:
+        """Carga todo el dataset en RAM. Thread-safe; evita cargas concurrentes."""
+        with self.lock:
+            if self.loaded or self.loading:
+                return self.loaded
+            self.loading = True
+
+        t0 = time.time()
+        connection = None
+        cursor = None
+        try:
+            connection = connect_dataset_db()
+            if not connection:
+                logger.warning("DatasetMatrixCache: no hay conexión al dataset")
+                return False
+
+            cursor = connection.cursor()
+            cursor.execute("""
+                SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
+                FROM ftir_spectra fs
+                JOIN zeolite_samples zs ON fs.sample_id = zs.id
+                JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
+            """)
+            rows = cursor.fetchall()
+
+            if not rows:
+                logger.warning("DatasetMatrixCache: dataset vacío")
+                return False
+
+            logger.info(f"DatasetMatrixCache: procesando {len(rows)} espectros...")
+
+            matrix_rows, metadata, peaks_list = [], [], []
+
+            for row in rows:
+                try:
+                    spec_data = json.loads(row[1]) if row[1] else {}
+                    wn = np.array(spec_data.get("wavenumbers") or [], dtype=np.float32)
+                    ab = np.array(
+                        spec_data.get("intensities") or spec_data.get("absorbance") or [],
+                        dtype=np.float32
+                    )
+                    if len(wn) < 2 or len(ab) < 2:
+                        continue
+
+                    interp_vec = self._interpolate_to_grid(wn, ab)
+                    if interp_vec is None:
+                        continue
+
+                    mn, mx = np.min(interp_vec), np.max(interp_vec)
+                    if mx - mn < 1e-10:
+                        continue
+                    norm_vec = (interp_vec - mn) / (mx - mn)
+
+                    pks = detect_peaks_vectorized(FIXED_GRID, norm_vec, threshold=0.05)
+
+                    matrix_rows.append(norm_vec)
+                    metadata.append({
+                        "spectrum_id": int(row[0]),
+                        "sample_code": row[2],
+                        "zeolite_name": row[3],
+                        "equipment": row[4],
+                        "measurement_date": str(row[5]) if row[5] else "N/A",
+                    })
+                    peaks_list.append(pks)
+                except Exception as e:
+                    logger.debug(f"DatasetMatrixCache: skip espectro {row[0]}: {e}")
+                    continue
+
+            if not matrix_rows:
+                logger.warning("DatasetMatrixCache: ningún espectro válido")
+                return False
+
+            mat = np.array(matrix_rows, dtype=np.float32)         # (N, L)
+
+            with self.lock:
+                self.matrix = mat
+                self.norms = np.linalg.norm(mat, axis=1)           # (N,)
+                self.means = np.mean(mat, axis=1)                   # (N,)
+                self.stds = np.std(mat, axis=1)                    # (N,)
+                self.metadata = metadata
+                self.peaks = peaks_list
+                self.total_loaded = len(matrix_rows)
+                self.load_time = datetime.now()
+                self.loaded = True
+                self.loading = False
+
+            elapsed = time.time() - t0
+            logger.info(
+                f"DatasetMatrixCache: {self.total_loaded} espectros cargados en {elapsed:.2f}s "
+                f"({mat.nbytes / 1024 / 1024:.1f} MB RAM)"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"DatasetMatrixCache: error al cargar: {e}", exc_info=True)
+            with self.lock:
+                self.loading = False
+            return False
+        finally:
+            if cursor:
+                try: cursor.close()
+                except: pass
+            if connection and connection.is_connected():
+                try: connection.close()
+                except: pass
+
+    def search(
+        self,
+        query_wn: np.ndarray,
+        query_ab: np.ndarray,
+        method: str = "pearson",
+        min_similarity: float = 0.5,
+        top_n: int = 10,
+        tolerance: float = 4.0,
+        family_filter: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Búsqueda vectorizada instantánea.
+        1. Interpola el query al FIXED_GRID.
+        2. Una sola operación matricial para todas las similitudes.
+        3. Filtra + ordena + retorna top_n.
+        """
+        if not self.loaded or self.matrix is None:
+            return []
+
+        interp = self._interpolate_to_grid(query_wn, query_ab)
+        if interp is None:
+            return []
+        mn, mx = np.min(interp), np.max(interp)
+        if mx - mn < 1e-10:
+            return []
+        query_norm = (interp - mn) / (mx - mn)
+
+        query_peaks = detect_peaks_vectorized(FIXED_GRID, query_norm, threshold=0.05)
+
+        L = len(FIXED_GRID)
+
+        if method == "cosine":
+            q_norm_val = float(np.linalg.norm(query_norm))
+            if q_norm_val < 1e-10:
+                return []
+            sims = (self.matrix @ query_norm) / (self.norms * q_norm_val + 1e-10)
+            sims = np.clip((sims + 1.0) / 2.0, 0.0, 1.0)
+
+        elif method == "pearson":
+            q_centered = query_norm - float(np.mean(query_norm))
+            q_std = float(np.std(query_norm))
+            if q_std < 1e-10:
+                return []
+            mat_centered = self.matrix - self.means[:, np.newaxis]
+            cov = (mat_centered @ q_centered) / L
+            sims = np.clip((cov / (self.stds * q_std + 1e-10) + 1.0) / 2.0, 0.0, 1.0)
+
+        elif method == "euclidean":
+            diffs = self.matrix - query_norm
+            distances = np.linalg.norm(diffs, axis=1) / (np.sqrt(L) + 1e-10)
+            sims = 1.0 / (1.0 + distances)
+
+        else:
+            return []
+
+        mask = sims >= min_similarity
+        if family_filter:
+            family_mask = np.array([m["zeolite_name"] == family_filter for m in self.metadata])
+            mask = mask & family_mask
+
+        valid_idx = np.where(mask)[0]
+        if len(valid_idx) == 0:
+            return []
+
+        sorted_idx = valid_idx[np.argsort(sims[valid_idx])[::-1]][:top_n]
+
+        results = []
+        for idx in sorted_idx:
+            peak_match = match_peaks_vectorized(query_peaks, self.peaks[idx], tolerance)
+            results.append({
+                **self.metadata[idx],
+                "similarity": float(sims[idx]),
+                "matching_peaks": peak_match["matched_count"],
+                "total_peaks": peak_match["total"],
+            })
+        return results
+
+    def reload(self):
+        """Fuerza recarga del cache (en background thread)."""
+        with self.lock:
+            self.loaded = False
+            self.loading = False
+            self.matrix = None
+        threading.Thread(target=self.load, daemon=True, name="dataset-cache-reload").start()
+
+
+dataset_matrix_cache = DatasetMatrixCache()
 
 # ========================================
 # CONFIGURACIÓN BD
@@ -553,14 +803,42 @@ def search_similarity(
             results.extend(user_results)
 
         logger.info(f"⚡ Iniciando búsqueda en dataset...")
-        dataset_results = search_similar_in_dataset_ultra_fast(
-            request.query_spectrum_id,
-            method=method.lower() if method in ["euclidean", "cosine", "pearson"] else "pearson",
-            top_n=top_n,
-            min_similarity=0.5,
-            tolerance=tolerance,
-            max_workers=12
-        )
+
+        # Parsear el espectro query para la búsqueda en dataset
+        try:
+            q_raw = json.loads(query_spectrum.wavenumber_data) if query_spectrum.wavenumber_data else {}
+            q_wn = np.array(q_raw.get("wavenumbers") or [], dtype=np.float32)
+            q_ab = np.array(
+                q_raw.get("absorbance") or q_raw.get("intensities") or [],
+                dtype=np.float32
+            )
+            if len(q_wn) == 0 and len(q_ab) > 0:
+                q_wn = np.linspace(400, 4000, len(q_ab), dtype=np.float32)
+        except Exception:
+            q_wn, q_ab = np.array([]), np.array([])
+
+        safe_method = method.lower() if method in ["euclidean", "cosine", "pearson"] else "pearson"
+
+        if dataset_matrix_cache.loaded and len(q_wn) > 0 and len(q_ab) > 0:
+            logger.info("⚡ Usando cache matricial (búsqueda instantánea)")
+            dataset_results = dataset_matrix_cache.search(
+                q_wn, q_ab,
+                method=safe_method,
+                min_similarity=0.5,
+                top_n=top_n,
+                tolerance=tolerance,
+                family_filter=family_filter,
+            )
+        else:
+            logger.info("⚠️ Cache no cargado, usando búsqueda tradicional")
+            dataset_results = search_similar_in_dataset_ultra_fast(
+                request.query_spectrum_id,
+                method=safe_method,
+                top_n=top_n,
+                min_similarity=0.5,
+                tolerance=tolerance,
+                max_workers=12,
+            )
 
         for result in dataset_results:
             results.append({
@@ -980,3 +1258,28 @@ def get_spectrum_info(spectrum_id: int):
             try:
                 connection.close()
             except Exception: pass
+
+
+# ========================================
+# ENDPOINTS DE CACHE MATRICIAL
+# ========================================
+
+@router.get("/cache/status")
+def get_cache_status(current_user: User = Depends(get_current_user)):
+    """Estado del cache matricial del dataset."""
+    c = dataset_matrix_cache
+    return {
+        "loaded": c.loaded,
+        "loading": c.loading,
+        "total_spectra": c.total_loaded,
+        "load_time": c.load_time.isoformat() if c.load_time else None,
+        "matrix_shape": list(c.matrix.shape) if c.matrix is not None else None,
+        "ram_mb": round(c.matrix.nbytes / 1024 / 1024, 2) if c.matrix is not None else 0,
+    }
+
+
+@router.post("/cache/reload")
+def reload_cache(current_user: User = Depends(get_current_user)):
+    """Fuerza la recarga del cache matricial en segundo plano."""
+    dataset_matrix_cache.reload()
+    return {"message": "Recarga del cache iniciada en segundo plano"}

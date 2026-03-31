@@ -5,6 +5,7 @@ Punto de entrada de la aplicación
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -161,6 +162,15 @@ async def startup_event():
     else:
         logger.error("❌ No se pudo conectar a MySQL")
         raise Exception("No se pudo conectar a la base de datos")
+
+    # Precargar el cache matricial del dataset en background (no bloquea el startup)
+    from app.routes.similarity import dataset_matrix_cache
+    threading.Thread(
+        target=dataset_matrix_cache.load,
+        daemon=True,
+        name="dataset-cache-preload"
+    ).start()
+    logger.info("⚡ Precarga del cache matricial iniciada en background")
 
     logger.info("🚀 ¡Aplicación lista para usar!\n")
 
