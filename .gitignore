@@ -1,0 +1,56 @@
+# ── Python ────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Entornos virtuales ────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Variables de entorno (SECRETOS) ───────
+.env
+.env.*
+!.env.example
+
+# ── Base de datos ─────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Cache y archivos grandes ──────────────
+cache/
+*.npz
+*.npy
+*.pkl
+*.h5
+*.hdf5
+
+# ── Uploads de usuarios ───────────────────
+uploads/spectra/
+uploads/temp/
+
+# ── IDEs ──────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ── Claude Code ───────────────────────────
+.claude/
+
+# ── Logs ──────────────────────────────────
+*.log
+logs/
+
+# ── Build / dist ──────────────────────────
+dist/
+build/
+*.egg-info/
+
+# ── OS ────────────────────────────────────
+.DS_Store
+Thumbs.db
