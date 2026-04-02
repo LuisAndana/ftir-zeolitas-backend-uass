@@ -6,7 +6,7 @@ Solo accesible por administradores
 
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.core.database import get_db
 from app.models.user import User
@@ -43,7 +43,16 @@ def list_users(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    users = db.query(User).order_by(User.created_at.desc()).all()
+    # load_only evita lazy-loading de la relación spectra (N+1 queries)
+    users = (
+        db.query(User)
+        .options(load_only(
+            User.id, User.name, User.email, User.role,
+            User.is_active, User.is_verified, User.created_at, User.updated_at
+        ))
+        .order_by(User.created_at.desc())
+        .all()
+    )
     return SuccessResponse(
         success=True,
         message="Usuarios obtenidos",
