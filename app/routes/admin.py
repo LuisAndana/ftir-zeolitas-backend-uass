@@ -47,7 +47,7 @@ def list_users(
     return SuccessResponse(
         success=True,
         message="Usuarios obtenidos",
-        data=[UserResponse.model_validate(u).model_dump() for u in users]
+        data={"users": [UserResponse.model_validate(u).model_dump() for u in users]}
     )
 
 
