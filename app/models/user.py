@@ -10,8 +10,10 @@ class User(Base):
     name = Column(String(255), nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
-    is_active = Column(Boolean, default=True)
-    is_verified = Column(Boolean, default=False)
+    role = Column(String(50), nullable=False, default="investigador")  # "investigador" | "administrador"
+    is_active = Column(Boolean, default=False)   # El admin activa la cuenta
+    is_verified = Column(Boolean, default=False)  # Verificación por correo
+    verification_token = Column(String(255), nullable=True, unique=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

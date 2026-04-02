@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     smtp_port: int = int(os.getenv("SMTP_PORT", "587"))
     smtp_email: str = os.getenv("SMTP_EMAIL", "")
     smtp_password: str = os.getenv("SMTP_PASSWORD", "")
+    smtp_from_name: str = os.getenv("SMTP_FROM_NAME", "FTIR Zeolitas UAS")
+    frontend_url: str = os.getenv("FRONTEND_URL", "http://localhost:4200")
 
     class Config:
         """Configuración de Pydantic"""

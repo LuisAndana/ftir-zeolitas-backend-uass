@@ -95,6 +95,7 @@ from app.routes.spectra import router as spectra_router
 from app.routes.zeolites import router as zeolites_router
 from app.routes.similarity import router as similarity_router
 from app.routes.dataset import router as dataset_router
+from app.routes.admin import router as admin_router
 
 logger.info("✅ Todos los routers importados")
 
@@ -134,12 +135,19 @@ app.include_router(
     tags=["dataset"]
 )
 
+app.include_router(
+    admin_router,
+    prefix="/api/admin",
+    tags=["administración"]
+)
+
 logger.info("✅ Routers registrados:")
 logger.info("   ✅ /api/auth")
 logger.info("   ✅ /api/spectra")
 logger.info("   ✅ /api/zeolites")
 logger.info("   ✅ /api/similarity")
 logger.info("   ✅ /api/dataset")
+logger.info("   ✅ /api/admin")
 
 # ========================================
 # EVENTOS

@@ -1,10 +1,11 @@
 """
 Rutas de autenticación
-Login, registro, refresh token
+Login, registro, verificación de correo, refresh token
 """
 
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status
+import secrets
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 from datetime import datetime
 
@@ -19,16 +20,15 @@ from app.core.security import (
     get_current_user,
     TokenManager
 )
+from app.core.email_utils import send_verification_email
 
 logger = logging.getLogger(__name__)
 
-# ✅ SIN PREFIX - El prefijo se agrega en main.py
 router = APIRouter(tags=["autenticación"])
 
 
 # ========================================
 # POST /register
-# Registrar nuevo usuario
 # ========================================
 
 @router.post(
@@ -37,13 +37,12 @@ router = APIRouter(tags=["autenticación"])
     status_code=status.HTTP_201_CREATED,
     summary="Registrar nuevo usuario",
 )
-def register(user_data: UserRegister, db: Session = Depends(get_db)):
-    """
-    Registrar un nuevo usuario en el sistema
-    """
-
+def register(
+    user_data: UserRegister,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
     try:
-        # Verificar si email ya existe
         existing_user = db.query(User).filter(
             User.email == user_data.email.lower()
         ).first()
@@ -54,30 +53,35 @@ def register(user_data: UserRegister, db: Session = Depends(get_db)):
                 detail="Este email ya está registrado"
             )
 
-        # Crear nuevo usuario
+        verification_token = secrets.token_urlsafe(48)
+
         db_user = User(
             name=user_data.name,
             email=user_data.email.lower(),
-            password_hash=hash_password(user_data.password)
+            password_hash=hash_password(user_data.password),
+            role="investigador",
+            is_active=False,       # El admin debe activar la cuenta
+            is_verified=False,     # El usuario debe verificar su correo
+            verification_token=verification_token,
         )
 
-        # Guardar en BD
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
 
-        # Generar tokens
-        tokens = generate_tokens(db_user.id)
+        background_tasks.add_task(
+            send_verification_email,
+            db_user.email,
+            db_user.name,
+            verification_token,
+        )
 
         logger.info(f"✅ Usuario registrado: {user_data.email}")
 
         return SuccessResponse(
             success=True,
-            message="Usuario registrado exitosamente",
-            data={
-                "user": UserResponse.model_validate(db_user).model_dump(),
-                **tokens
-            }
+            message="Cuenta creada. Revisa tu correo para verificar tu dirección.",
+            data=None
         )
 
     except HTTPException:
@@ -92,8 +96,43 @@ def register(user_data: UserRegister, db: Session = Depends(get_db)):
 
 
 # ========================================
+# GET /verify-email
+# ========================================
+
+@router.get(
+    "/verify-email",
+    response_model=SuccessResponse,
+    summary="Verificar correo con token",
+)
+def verify_email(token: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.verification_token == token).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token de verificación inválido o ya utilizado"
+        )
+
+    if user.is_verified:
+        return SuccessResponse(
+            success=True,
+            message="Tu correo ya fue verificado previamente"
+        )
+
+    user.is_verified = True
+    user.verification_token = None
+    db.commit()
+
+    logger.info(f"✅ Correo verificado: {user.email}")
+
+    return SuccessResponse(
+        success=True,
+        message="Correo verificado exitosamente. Un administrador activará tu cuenta pronto."
+    )
+
+
+# ========================================
 # POST /login
-# Iniciar sesión
 # ========================================
 
 @router.post(
@@ -102,37 +141,30 @@ def register(user_data: UserRegister, db: Session = Depends(get_db)):
     summary="Iniciar sesión",
 )
 def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    """
-    Iniciar sesión con email y contraseña
-    """
-
     try:
-        # Buscar usuario por email
         user = db.query(User).filter(
             User.email == user_data.email.lower()
         ).first()
 
-        # Validar usuario y contraseña
         if not user or not verify_password(user_data.password, user.password_hash):
-            logger.warning(f"❌ Intento de login fallido: {user_data.email}")
+            logger.warning(f"❌ Login fallido: {user_data.email}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Email o contraseña incorrectos"
             )
 
-        # Validar que el usuario esté activo
+        if not user.is_verified:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="EMAIL_NOT_VERIFIED"
+            )
+
         if not user.is_active:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Usuario inactivo"
+                detail="ACCOUNT_PENDING_APPROVAL"
             )
 
-        # Actualizar último login
-        user.last_login = datetime.utcnow()
-        db.commit()
-        db.refresh(user)
-
-        # Generar tokens
         tokens = generate_tokens(user.id)
 
         logger.info(f"✅ Login exitoso: {user.email}")
@@ -142,7 +174,8 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
             message="Login exitoso",
             data={
                 "user": UserResponse.model_validate(user).model_dump(),
-                **tokens
+                **tokens,
+                "expires_in": 3600
             }
         )
 
@@ -158,7 +191,6 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
 
 # ========================================
 # POST /refresh
-# Refrescar access token
 # ========================================
 
 @router.post(
@@ -167,13 +199,9 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
     summary="Refrescar access token",
 )
 def refresh_access_token(
-        refresh_token_data: dict,
-        db: Session = Depends(get_db)
+    refresh_token_data: dict,
+    db: Session = Depends(get_db)
 ):
-    """
-    Usar refresh token para obtener nuevo access token
-    """
-
     try:
         refresh_token = refresh_token_data.get("refresh_token")
 
@@ -183,11 +211,9 @@ def refresh_access_token(
                 detail="Refresh token requerido"
             )
 
-        # Verificar refresh token
         payload = TokenManager.verify_token(refresh_token)
         user_id = payload.get("sub")
 
-        # Obtener usuario
         user = db.query(User).filter(User.id == int(user_id)).first()
 
         if not user or not user.is_active:
@@ -196,12 +222,9 @@ def refresh_access_token(
                 detail="Usuario no encontrado o inactivo"
             )
 
-        # Generar nuevo access token
-        new_access_token = TokenManager.create_access_token(
-            data={"sub": user.id}
-        )
+        new_access_token = TokenManager.create_access_token(data={"sub": user.id})
 
-        logger.info(f"✅ Token refrescado para usuario: {user.email}")
+        logger.info(f"✅ Token refrescado: {user.email}")
 
         return SuccessResponse(
             success=True,
@@ -209,7 +232,7 @@ def refresh_access_token(
             data={
                 "access_token": new_access_token,
                 "token_type": "bearer",
-                "expires_in": 60 * 60
+                "expires_in": 3600
             }
         )
 
@@ -225,7 +248,6 @@ def refresh_access_token(
 
 # ========================================
 # GET /me
-# Obtener usuario actual
 # ========================================
 
 @router.get(
@@ -234,22 +256,15 @@ def refresh_access_token(
     summary="Obtener usuario actual",
 )
 def get_me(current_user: User = Depends(get_current_user)):
-    """
-    Obtener información del usuario autenticado
-    """
-
     return SuccessResponse(
         success=True,
         message="Usuario obtenido",
-        data={
-            "user": UserResponse.model_validate(current_user).model_dump()
-        }
+        data={"user": UserResponse.model_validate(current_user).model_dump()}
     )
 
 
 # ========================================
 # POST /logout
-# Logout
 # ========================================
 
 @router.post(
@@ -258,13 +273,5 @@ def get_me(current_user: User = Depends(get_current_user)):
     summary="Cerrar sesión",
 )
 def logout(current_user: User = Depends(get_current_user)):
-    """
-    Cerrar sesión
-    """
-
     logger.info(f"✅ Logout: {current_user.email}")
-
-    return SuccessResponse(
-        success=True,
-        message="Sesión cerrada exitosamente"
-    )
+    return SuccessResponse(success=True, message="Sesión cerrada exitosamente")

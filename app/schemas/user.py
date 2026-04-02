@@ -34,17 +34,20 @@ class UserResponse(BaseModel):
     id: int
     name: str
     email: str
-    institution: Optional[str] = None
-    department: Optional[str] = None
-    research_area: Optional[str] = None
+    role: str = "investigador"
     is_active: bool
     is_verified: bool
     created_at: datetime
     updated_at: datetime
-    last_login: Optional[datetime] = None
 
     class Config:
         from_attributes = True
+
+
+class UserAdminUpdate(BaseModel):
+    """Schema para que el admin actualice un usuario"""
+    is_active: Optional[bool] = None
+    role: Optional[str] = None
 
 
 class UserUpdate(BaseModel):
