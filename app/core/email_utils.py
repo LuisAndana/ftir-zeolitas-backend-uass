@@ -118,6 +118,81 @@ def send_verification_email(to_email: str, name: str, token: str) -> bool:
     return send_email(to_email, "Verifica tu correo - FTIR Zeolitas UAS", html_body)
 
 
+def send_password_reset_email(to_email: str, name: str, token: str) -> bool:
+    """Correo con enlace para restablecer contraseña (válido 15 minutos)."""
+    reset_url = f"{settings.frontend_url}/reset-password?token={token}"
+
+    html_body = f"""
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr><td align="center" style="padding:40px 20px;">
+      <table width="600" cellpadding="0" cellspacing="0"
+             style="background:white;border-radius:12px;overflow:hidden;
+                    box-shadow:0 4px 20px rgba(0,0,0,0.1);max-width:600px;width:100%;">
+        <tr>
+          <td style="background:linear-gradient(135deg,#1e3a5f,#16324f);
+                     padding:35px 40px;text-align:center;">
+            <h1 style="color:white;margin:0;font-size:24px;">🔬 FTIR Zeolitas UAS</h1>
+            <p style="color:rgba(255,255,255,0.75);margin:8px 0 0;font-size:14px;">
+              Sistema de Análisis Espectroscópico
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:40px;">
+            <h2 style="color:#1e3a5f;margin-top:0;">Restablecer contraseña</h2>
+            <p style="color:#4b5563;line-height:1.7;">Hola <strong>{name}</strong>,</p>
+            <p style="color:#4b5563;line-height:1.7;">
+              Recibimos una solicitud para restablecer la contraseña de tu cuenta.
+              Haz clic en el botón de abajo para crear una nueva contraseña.
+            </p>
+            <div style="background:#fff7ed;border-left:4px solid #f97316;
+                        padding:16px 20px;border-radius:0 8px 8px 0;margin:24px 0;">
+              <p style="margin:0;color:#92400e;font-size:14px;line-height:1.6;">
+                <strong>⚠ Este enlace expira en 15 minutos.</strong>
+                Si no solicitaste este cambio, puedes ignorar este correo con seguridad.
+              </p>
+            </div>
+            <div style="text-align:center;margin:32px 0;">
+              <a href="{reset_url}"
+                 style="display:inline-block;background:linear-gradient(135deg,#1e3a5f,#2E75B6);
+                        color:white;padding:15px 36px;border-radius:8px;
+                        text-decoration:none;font-weight:bold;font-size:16px;">
+                🔑 Restablecer Contraseña
+              </a>
+            </div>
+            <p style="color:#6b7280;font-size:13px;">
+              Si el botón no funciona, copia este enlace en tu navegador:
+            </p>
+            <p style="word-break:break-all;color:#2E75B6;font-size:13px;
+                      background:#f8fafc;padding:10px 15px;border-radius:6px;">
+              {reset_url}
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#f8fafc;padding:20px 40px;text-align:center;
+                     border-top:1px solid #e5e7eb;">
+            <p style="color:#9ca3af;font-size:13px;margin:0;">
+              Si no solicitaste restablecer tu contraseña, ignora este correo.
+            </p>
+            <p style="color:#9ca3af;font-size:13px;margin:8px 0 0;">
+              © 2025 FTIR Zeolitas UAS · Universidad Autónoma de Sinaloa
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
+"""
+    return send_email(to_email, "Restablecer contraseña - FTIR Zeolitas UAS", html_body)
+
+
 def send_activation_email(to_email: str, name: str) -> bool:
     """Correo que se envía cuando el admin activa la cuenta."""
     login_url = f"{settings.frontend_url}/welcome"

@@ -60,9 +60,13 @@ def get_db():
         def my_route(db: Session = Depends(get_db)):
             ...
     """
+    from fastapi import HTTPException as FastAPIHTTPException
     db = SessionLocal()
     try:
         yield db
+    except FastAPIHTTPException:
+        db.rollback()
+        raise
     except Exception as e:
         logger.error(f"Error en sesión de BD: {e}")
         db.rollback()

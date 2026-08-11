@@ -14,6 +14,8 @@ class User(Base):
     is_active = Column(Boolean, default=False)   # El admin activa la cuenta
     is_verified = Column(Boolean, default=False)  # Verificación por correo
     verification_token = Column(String(255), nullable=True, unique=True)
+    reset_token = Column(String(255), nullable=True, unique=True)
+    reset_token_expires_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

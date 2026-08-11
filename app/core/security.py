@@ -273,10 +273,10 @@ async def get_current_user(
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 async def get_current_user_v2(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
     """
@@ -291,6 +291,13 @@ async def get_current_user_v2(
     Returns:
         User: Usuario autenticado
     """
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No autenticado",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     token = credentials.credentials
 

@@ -7,7 +7,7 @@ import logging
 import secrets
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from app.core.database import get_db
 from app.models.user import User
@@ -20,7 +20,7 @@ from app.core.security import (
     get_current_user,
     TokenManager
 )
-from app.core.email_utils import send_verification_email
+from app.core.email_utils import send_verification_email, send_password_reset_email
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +244,97 @@ def refresh_access_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token inválido"
         )
+
+
+# ========================================
+# POST /forgot-password
+# ========================================
+
+@router.post(
+    "/forgot-password",
+    response_model=SuccessResponse,
+    summary="Solicitar restablecimiento de contraseña",
+)
+def forgot_password(
+    body: dict,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    email = body.get("email", "").strip().lower()
+
+    # Buscar usuario sin revelar si existe (previene enumeración de emails)
+    user = db.query(User).filter(User.email == email).first()
+
+    if user and user.is_active and user.is_verified:
+        reset_token = secrets.token_urlsafe(32)
+        user.reset_token = reset_token
+        # Store as naive UTC so MySQL comparison works without timezone mismatch
+        user.reset_token_expires_at = datetime.utcnow() + timedelta(minutes=15)
+        db.commit()
+        background_tasks.add_task(send_password_reset_email, user.email, user.name, reset_token)
+        logger.info(f"🔑 Reset de contraseña solicitado: {email}")
+
+    return SuccessResponse(
+        success=True,
+        message="Si el correo está registrado, recibirás un enlace de recuperación en breve."
+    )
+
+
+# ========================================
+# POST /reset-password
+# ========================================
+
+@router.post(
+    "/reset-password",
+    response_model=SuccessResponse,
+    summary="Restablecer contraseña con token",
+)
+def reset_password(body: dict, db: Session = Depends(get_db)):
+    token = body.get("token", "").strip()
+    new_password = body.get("new_password", "")
+
+    if not token or not new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token y nueva contraseña son requeridos"
+        )
+
+    if len(new_password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="La contraseña debe tener al menos 8 caracteres"
+        )
+
+    user = db.query(User).filter(User.reset_token == token).first()
+
+    if not user or not user.reset_token_expires_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INVALID_TOKEN"
+        )
+
+    # Compare as naive UTC — MySQL returns naive datetimes
+    expires_at = user.reset_token_expires_at.replace(tzinfo=None) if user.reset_token_expires_at.tzinfo else user.reset_token_expires_at
+    if datetime.utcnow() > expires_at:
+        user.reset_token = None
+        user.reset_token_expires_at = None
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="EXPIRED_TOKEN"
+        )
+
+    user.password_hash = hash_password(new_password)
+    user.reset_token = None
+    user.reset_token_expires_at = None
+    db.commit()
+
+    logger.info(f"✅ Contraseña restablecida: {user.email}")
+
+    return SuccessResponse(
+        success=True,
+        message="Contraseña actualizada correctamente. Ya puedes iniciar sesión."
+    )
 
 
 # ========================================
