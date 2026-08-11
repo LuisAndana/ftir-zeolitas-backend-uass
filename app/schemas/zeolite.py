@@ -11,11 +11,14 @@ class ZeoliteFamilyResponse(BaseModel):
     id: int
     code: str
     name: str
-    category: str
-    si_al_ratio: Optional[str]
-    pore_size: Optional[str]
-    typical_bands: Optional[List[float]]
-    description: Optional[str]
+    category: Optional[str] = None
+    si_al_ratio: Optional[str] = None
+    pore_size: Optional[str] = None
+    typical_bands: Optional[List[float]] = None
+    ring_size: Optional[str] = None
+    channel_dimensionality: Optional[str] = None
+    cif_filename: Optional[str] = None
+    description: Optional[str] = None
 
     class Config:
         from_attributes = True

@@ -5,13 +5,40 @@ Información de referencia sobre familias de zeolitas
 
 import logging
 from fastapi import APIRouter, Depends, Query, HTTPException, status
+from fastapi.responses import PlainTextResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from typing import Optional
+from pathlib import Path
 
 from app.core.database import get_db
 from app.models.zeolite_family import ZeoliteFamily
 from app.schemas.zeolite import ZeoliteFamilyResponse
 from app.schemas.common import SuccessResponse, PaginatedResponse
+from app.services.zeolite_dataset_loader import ZeoliteDatasetLoader
+
+# Directorio de archivos CIF de estructuras cristalográficas (IZA Structure
+# Database). 29/35 familias del catálogo ya tienen .cif real descargado
+# (ver static/structures/README.md) — este directorio sirve los que existen
+# y responde 404/cif_available=false para el resto.
+CIF_STRUCTURES_DIR = Path(__file__).resolve().parent.parent.parent / "static" / "structures"
+
+# Códigos para los que NUNCA existirá un CIF — no es un pendiente, es una
+# limitación real de los materiales (ver static/structures/README.md para
+# el detalle y las fuentes de cada uno). Se expone al frontend para que
+# muestre un mensaje honesto en vez de sugerir "todavía no descargado".
+NO_CIF_POSSIBLE_REASONS = {
+    code: (
+        "Sílice mesoporosa amorfa: no tiene cristalinidad de largo alcance, "
+        "por lo tanto no existe una estructura periódica que describir en un CIF."
+    )
+    for code in ZeoliteDatasetLoader.AMORPHOUS_MESOPOROUS_CODES
+}
+NO_CIF_POSSIBLE_REASONS["NU86"] = (
+    "La IZA nunca le asignó un código de framework de 3 letras a NU-86 "
+    "(confirmado en las patentes originales ICI/IFP US6165439 y US6337428) — "
+    "no existe un CIF oficial que descargar."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +156,97 @@ def get_zeolite_by_code(
 
 
 # ========================================
+# GET /{code}/structure
+# Estructura cristalográfica (CIF) + bandas diagnósticas para el visor 3D
+# Fase 0-1 de la hoja de ruta banda↔estructura (ver CLAUDE.md).
+# ========================================
+
+@router.get(
+    "/{code}/structure",
+    summary="Obtener estructura cristalográfica (CIF) y bandas diagnósticas",
+)
+def get_zeolite_structure(
+    code: str,
+    format: str = Query("json", pattern="^(json|cif)$"),
+    db: Session = Depends(get_db),
+):
+    """
+    Metadatos estructurales de la familia (bandas típicas Flanigen, Si/Al,
+    tamaño de anillo, dimensionalidad de canal) y, si ya se descargó
+    localmente, el contenido del archivo CIF (IZA Structure Database) para
+    alimentar el visor 3D banda↔estructura.
+
+    - format=json (default): metadatos + CIF embebido como texto si existe.
+    - format=cif: el archivo CIF crudo (Content-Type: chemical/x-cif); 404 con
+      instrucciones si aún no se ha descargado.
+
+    Los .cif reales NO se descargan automáticamente (requieren permiso
+    explícito, ver Fase 0 de la hoja de ruta) — deben colocarse manualmente en
+    static/structures/{code}.cif, obtenidos de la IZA Structure Database.
+    """
+    code_upper = code.upper()
+    zeolite = db.query(ZeoliteFamily).filter(ZeoliteFamily.code == code_upper).first()
+    if not zeolite:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Familia de zeolita '{code}' no encontrada")
+
+    cif_filename = zeolite.cif_filename or f"{code_upper}.cif"
+    cif_path = CIF_STRUCTURES_DIR / cif_filename
+    cif_content = None
+    cif_available = cif_path.is_file()
+    if cif_available:
+        try:
+            cif_content = cif_path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"⚠️ No se pudo leer CIF {cif_path}: {e}")
+            cif_available = False
+
+    if format == "cif":
+        if not cif_available:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"CIF no disponible localmente para '{code_upper}'. Descargar de la IZA "
+                    f"Structure Database (https://europe.iza-structure.org/IZA-SC/ftc_table.php, "
+                    f"buscar el código '{code_upper}') y guardar en static/structures/{cif_filename}."
+                ),
+            )
+        return PlainTextResponse(cif_content, media_type="chemical/x-cif")
+
+    no_cif_reason = None if cif_available else NO_CIF_POSSIBLE_REASONS.get(code_upper)
+
+    return SuccessResponse(
+        success=True,
+        message="Estructura obtenida" if cif_available else "Metadatos obtenidos (CIF aún no descargado)",
+        data={
+            "code": zeolite.code,
+            "name": zeolite.name,
+            "si_al_ratio": zeolite.si_al_ratio,
+            "pore_size": zeolite.pore_size,
+            "ring_size": zeolite.ring_size,
+            "channel_dimensionality": zeolite.channel_dimensionality,
+            "typical_bands": zeolite.typical_bands,
+            "cif_available": cif_available,
+            "cif_content": cif_content,
+            # True cuando NO existe (ni existirá) un CIF real para este código
+            # — sílice amorfa o framework sin código IZA asignado (ver
+            # NO_CIF_POSSIBLE_REASONS). El frontend usa esto para mostrar un
+            # mensaje honesto ("nunca tendrá modelo 3D") en vez de sugerir que
+            # falta descargarlo.
+            "cif_permanently_unavailable": no_cif_reason is not None,
+            "cif_unavailable_reason": no_cif_reason,
+            # Solo la URL limpia — el código a buscar se muestra aparte en el
+            # frontend (structure.code), nunca concatenado dentro del href:
+            # antes el string completo "url (buscar 'CODE')" se usaba tal
+            # cual como [href], y el navegador URL-codificaba el paréntesis
+            # como parte de la ruta -> 404 en el sitio de la IZA.
+            "cif_source_hint": None if (cif_available or no_cif_reason) else (
+                "https://europe.iza-structure.org/IZA-SC/ftc_table.php"
+            ),
+        },
+    )
+
+
+# ========================================
 # GET /data/categories
 # Obtener categorías
 # ========================================
@@ -186,7 +304,7 @@ def get_statistics(db: Session = Depends(get_db)):
 
         categories_data = db.query(
             ZeoliteFamily.category,
-            db.func.count(ZeoliteFamily.id).label('count')
+            func.count(ZeoliteFamily.id).label('count')
         ).group_by(ZeoliteFamily.category).all()
 
         categories_by_count = {

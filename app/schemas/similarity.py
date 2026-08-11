@@ -11,9 +11,10 @@ class SimilarityConfig(BaseModel):
 
     method: str = Field(default="cosine", description="Método: cosine, pearson, euclidean")
     tolerance: float = Field(default=4, ge=0.1, le=10, description="Tolerancia en cm⁻¹")
-    range_min: int = Field(default=400, ge=0, le=4000, description="Rango mínimo cm⁻¹")
-    range_max: int = Field(default=4000, ge=0, le=4000, description="Rango máximo cm⁻¹")
+    range_min: int = Field(default=400, ge=0, le=4000, description="Rango mínimo cm⁻¹ (no aplicado desde el pipeline unificado; ver CLAUDE.md)")
+    range_max: int = Field(default=4000, ge=0, le=4000, description="Rango máximo cm⁻¹ (no aplicado desde el pipeline unificado; ver CLAUDE.md)")
     top_n: int = Field(default=10, ge=1, le=100, description="Número de resultados")
+    min_similarity: float = Field(default=0.5, ge=0.0, le=1.0, description="Score mínimo para incluir un resultado del dataset")
     family_filter: Optional[str] = Field(default=None, description="Filtrar por familia")
     use_windows: bool = Field(default=False, description="Usar ventanas espectrales")
     selected_windows: List[str] = Field(default_factory=list, description="Ventanas seleccionadas")
@@ -39,6 +40,7 @@ class SimilarityResult(BaseModel):
     spectrum_id: int
     filename: str
     family: Optional[str] = None
+    framework_code: Optional[str] = Field(default=None, description="Código IZA (p.ej. 'LTA') para GET /zeolites/{code}/structure")
     global_score: float = Field(..., ge=0, le=1)
     window_scores: List[Dict[str, Any]] = Field(default_factory=list)
     matching_peaks: int = 0

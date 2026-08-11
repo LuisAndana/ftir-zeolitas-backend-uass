@@ -27,9 +27,16 @@ class SimilarityResult(Base):
     range_min = Column(Integer, default=400)
     range_max = Column(Integer, default=4000)
     top_n = Column(Integer, default=10)
+    min_similarity = Column(Float, default=0.5)
     family_filter = Column(String(50), nullable=True)
     use_windows = Column(Boolean, default=False)
     selected_windows = Column(JSON, nullable=True)
+
+    # Versión del pipeline que produjo estos scores — ver
+    # app.services.spectral_preprocessing.ALGORITHM_VERSION. Necesario para
+    # reproducibilidad: si el algoritmo cambia, un score histórico solo es
+    # comparable a otro si comparten esta versión.
+    algorithm_version = Column(String(20), nullable=True)
 
     # Resultados (almacenados como JSON)
     results = Column(JSON, nullable=False)  # Lista de resultados con scores

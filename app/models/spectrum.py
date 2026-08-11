@@ -4,6 +4,7 @@ Modelo para espectros FTIR
 
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, func
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -25,8 +26,17 @@ class Spectrum(Base):
     hydration_state = Column(String(100), nullable=True)  # As-synthesized, Secado, Calcinado
     temperature = Column(String(50), nullable=True)  # Temperatura de medición
 
-    # Datos del espectro (JSON string con wavenumbers y absorbance)
-    wavenumber_data = Column(Text, nullable=True, default='{"wavenumbers": [], "absorbance": []}')
+    # Datos del espectro (JSON string con wavenumbers y absorbance).
+    # LONGTEXT en MySQL (hasta 4 GB) en vez de TEXT (límite real de 64 KB, que
+    # puede truncar SILENCIOSAMENTE según sql_mode un espectro de resolución
+    # fina: 1800-7200 puntos con floats en JSON ronda o supera 64 KB). Sigue
+    # siendo JSON de texto plano — sin cambios en la serialización/lectura.
+    # with_variant: Text genérico en cualquier otro dialecto (SQLite en tests),
+    # LONGTEXT específicamente en MySQL — mysql.LONGTEXT no es compilable en SQLite.
+    wavenumber_data = Column(
+        Text().with_variant(LONGTEXT, "mysql"),
+        nullable=True, default='{"wavenumbers": [], "absorbance": []}',
+    )
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -11,6 +11,10 @@ from typing import Optional, List, Dict
 from scipy.interpolate import interp1d
 import logging
 
+from app.services.spectral_preprocessing import (
+    preprocess_spectrum, mask_atmospheric_co2, compute_window_scores, STRUCTURAL_WEIGHT,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,8 +53,11 @@ class SimilarityCalculator:
     @staticmethod
     def pearson_correlation(a: List[float], b: List[float]) -> float:
         """
-        Correlación de Pearson: normalizado a 0-1
-        Mide la relación lineal entre dos series
+        Hit Quality Index (HQI) = r² (coeficiente de correlación de Pearson al
+        cuadrado), rango 0-1. Es el estándar de facto en espectroscopía FTIR
+        comercial (p. ej. Thermo OMNIC reporta HQI = r²·100). A diferencia del
+        antiguo remapeo (r+1)/2, r=0 (sin relación lineal) da correctamente 0, no
+        un engañoso "50% de similitud".
         ✅ MEJORADO: Validaciones robustas
         """
         if len(a) < 2 or len(b) < 2 or len(a) != len(b):
@@ -81,11 +88,11 @@ class SimilarityCalculator:
                 logger.warning("⚠️ Pearson: Denominador es 0")
                 return 0.0
 
-            # Correlación (-1 a 1) normalizada a (0 a 1)
+            # HQI = r² (correlación al cuadrado) — estándar de facto en FTIR comercial
             correlation = numerator / (denom_a * denom_b)
-            result = (correlation + 1) / 2
+            result = correlation ** 2
 
-            logger.debug(f"   Pearson raw: {correlation:.4f}, normalized: {result:.4f}")
+            logger.debug(f"   Pearson raw: {correlation:.4f}, HQI (r²): {result:.4f}")
             return float(result)
 
         except Exception as e:
@@ -204,11 +211,13 @@ class SimilarityCalculator:
                      tolerance: float) -> tuple:
         """
         ✅ MEJORADO: Alineación más robusta usando interpolación
-        Retorna: (aligned_abs1, aligned_abs2)
+        Retorna: (aligned_abs1, aligned_abs2, aligned_wn) — aligned_wn son los
+        números de onda (cm⁻¹) correspondientes a cada punto alineado, necesarios
+        para aplicar las ventanas diagnósticas Flanigen por región espectral.
         """
         if not wn1 or not abs1 or not wn2 or not abs2:
             logger.error("❌ align_spectra: Datos vacíos")
-            return [], []
+            return [], [], []
 
         try:
             wn1_arr = np.array(wn1, dtype=float)
@@ -222,7 +231,7 @@ class SimilarityCalculator:
 
             if min_wn >= max_wn:
                 logger.error(f"❌ No hay solapamiento: [{np.min(wn1_arr):.2f}, {np.max(wn1_arr):.2f}] vs [{np.min(wn2_arr):.2f}, {np.max(wn2_arr):.2f}]")
-                return [], []
+                return [], [], []
 
             logger.debug(f"   Rango común: {min_wn:.2f} - {max_wn:.2f}")
 
@@ -237,7 +246,7 @@ class SimilarityCalculator:
 
             if len(wn1_filtered) < 2 or len(wn2_filtered) < 2:
                 logger.error("❌ Insuficientes puntos después de filtrar al rango común")
-                return [], []
+                return [], [], []
 
             logger.debug(f"   Puntos en rango común: {len(wn1_filtered)} vs {len(wn2_filtered)}")
 
@@ -258,9 +267,10 @@ class SimilarityCalculator:
                 # Convertir a listas de floats
                 aligned1 = [float(x) for x in aligned1]
                 aligned2 = [float(x) for x in aligned2]
+                aligned_wn = [float(x) for x in common_wn]
 
                 logger.debug(f"   ✅ Alineados {len(aligned1)} puntos por interpolación")
-                return aligned1, aligned2
+                return aligned1, aligned2, aligned_wn
 
             except Exception as interp_error:
                 logger.warning(f"⚠️ Fallo interpolación, usando nearest neighbor: {interp_error}")
@@ -268,6 +278,7 @@ class SimilarityCalculator:
                 # Fallback: nearest neighbor
                 aligned1 = []
                 aligned2 = []
+                aligned_wn = []
 
                 for target_wn in wn1_filtered:
                     distances = np.abs(wn2_filtered - target_wn)
@@ -277,13 +288,14 @@ class SimilarityCalculator:
                     if min_dist <= tolerance:
                         aligned1.append(float(abs1_filtered[np.where(wn1_filtered == target_wn)[0][0]]))
                         aligned2.append(float(abs2_filtered[min_idx]))
+                        aligned_wn.append(float(target_wn))
 
                 logger.debug(f"   ✅ Alineados {len(aligned1)} puntos por nearest neighbor")
-                return aligned1, aligned2
+                return aligned1, aligned2, aligned_wn
 
         except Exception as e:
             logger.error(f"❌ Error en alineación: {e}", exc_info=True)
-            return [], []
+            return [], [], []
 
     @staticmethod
     def detect_peaks(wavenumbers: List[float], absorbance: List[float],
@@ -362,8 +374,10 @@ class SimilarityCalculator:
                             tolerance: float = 4, range_min: int = 400,
                             range_max: int = 4000, peak_threshold: float = None) -> Optional[Dict]:
         """
-        ✅ VERSIÓN MEJORADA CON LOGGING DETALLADO EN 6 FASES
-        Calcula similitud entre dos espectros FTIR
+        ✅ VERSIÓN MEJORADA CON LOGGING DETALLADO EN 7 FASES
+        Calcula similitud entre dos espectros FTIR. Incluye preprocesamiento
+        (máscara de CO2 atmosférico, corrección de línea base arPLS, suavizado
+        Savitzky-Golay, normalización SNV) antes de alinear y puntuar.
 
         Args:
             spectrum1: Primer espectro (objeto con wavenumber_data)
@@ -413,9 +427,17 @@ class SimilarityCalculator:
                 logger.error(f"❌ FALLÓ: Datos vacíos después de filtrar")
                 return None
 
+            # 2️⃣.5️⃣ PREPROCESAMIENTO: máscara CO2 + arPLS + Savitzky-Golay + SNV
+            logger.info(f"2️⃣.5️⃣ FASE: PREPROCESAMIENTO ESPECTRAL")
+            abs1 = mask_atmospheric_co2(wn1, abs1).tolist()
+            abs2 = mask_atmospheric_co2(wn2, abs2).tolist()
+            abs1 = preprocess_spectrum(abs1).tolist()
+            abs2 = preprocess_spectrum(abs2).tolist()
+            logger.info(f"   Línea base (arPLS) + suavizado (Savitzky-Golay) + SNV aplicados")
+
             # 3️⃣ ALINEAR ESPECTROS
             logger.info(f"3️⃣ FASE: ALINEAMIENTO DE ESPECTROS")
-            aligned1, aligned2 = self.align_spectra(wn1, abs1, wn2, abs2, tolerance)
+            aligned1, aligned2, aligned_wn = self.align_spectra(wn1, abs1, wn2, abs2, tolerance)
 
             logger.info(f"   Puntos alineados: {len(aligned1)}")
 
@@ -423,20 +445,24 @@ class SimilarityCalculator:
                 logger.error(f"❌ FALLÓ: No se alinearon espectros")
                 return None
 
-            # 4️⃣ CALCULAR SIMILITUD
-            logger.info(f"4️⃣ FASE: CÁLCULO DE SIMILITUD")
-            if method == "cosine":
-                score = self.cosine_similarity(aligned1, aligned2)
-            elif method == "pearson":
-                score = self.pearson_correlation(aligned1, aligned2)
-            elif method == "euclidean":
-                score = self.euclidean_similarity(aligned1, aligned2)
-            else:
+            # 4️⃣ CALCULAR SIMILITUD — ventanas Flanigen ponderadas (huella
+            # dactilar 400-1300 cm⁻¹ pesa STRUCTURAL_WEIGHT; el resto, 1-ese peso)
+            logger.info(f"4️⃣ FASE: CÁLCULO DE SIMILITUD (ventanas Flanigen)")
+            safe_method = method if method in ("cosine", "pearson", "euclidean") else "pearson"
+            if method not in ("cosine", "pearson", "euclidean"):
                 logger.warning(f"⚠️ Método desconocido '{method}', usando pearson")
-                score = self.pearson_correlation(aligned1, aligned2)
 
-            logger.info(f"   Método: {method}")
-            logger.info(f"   Score: {score:.4f} ({score*100:.2f}%)")
+            windowed = compute_window_scores(
+                np.array(aligned_wn, dtype=np.float64),
+                np.array(aligned1, dtype=np.float64),
+                np.array(aligned2, dtype=np.float64),
+                method=safe_method,
+            )
+            score = windowed["global_score"]
+            window_scores = windowed["window_scores"]
+
+            logger.info(f"   Método: {safe_method}")
+            logger.info(f"   Score global (ponderado {STRUCTURAL_WEIGHT:.0%}/{1-STRUCTURAL_WEIGHT:.0%}): {score:.4f} ({score*100:.2f}%)")
 
             if score < 0 or score > 1:
                 logger.warning(f"⚠️ Score fuera de rango [0-1]: {score}")
@@ -461,7 +487,7 @@ class SimilarityCalculator:
 
             return {
                 "global_score": max(0, min(1, float(score))),
-                "window_scores": [],
+                "window_scores": window_scores,
                 "matching_peaks": len(peak_match["matched"]),
                 "total_peaks": peak_match["total"],
                 "matched_peaks": peak_match["matched"],

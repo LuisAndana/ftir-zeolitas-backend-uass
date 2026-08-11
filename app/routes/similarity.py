@@ -3,8 +3,11 @@
 ✅ FIXES v2:
 - detect_peaks_vectorized ahora usa wavenumbers REALES (no índices)
 - match_peaks_vectorized usa tolerancia en cm⁻¹ correctamente
-- search_similar_in_dataset_ultra_fast pasa wavenumbers reales a detect_peaks
 - Mejor manejo de conexiones MySQL con try-finally
+✅ P2: pipeline unificado — espectros de usuario y dataset comparten
+  interpolate_and_preprocess + vectorized_similarity (mismo preprocesamiento y
+  misma fórmula de score); se retiró la ruta de respaldo que comparaba espectros
+  por índice de array sin usar los números de onda.
 """
 
 import logging
@@ -17,9 +20,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import numpy as np
-from scipy.spatial.distance import euclidean, cosine
-from scipy.stats import pearsonr
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from typing import Dict, List, Tuple, Optional
 
@@ -27,8 +28,14 @@ from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.spectrum import Spectrum
 from app.models.user import User
+from app.routes.admin import require_admin
 from app.schemas.similarity import SimilaritySearchRequest
 from app.services.similarity_calculator import SimilarityCalculator
+from app.services.spectral_preprocessing import (
+    interpolate_and_preprocess, weighted_matrix_similarity,
+    compute_window_scores, structural_region_mask, ALGORITHM_VERSION,
+)
+from app.models.similarity_result import SimilarityResult as SimilarityResultModel
 import mysql.connector
 from mysql.connector import Error
 
@@ -78,6 +85,10 @@ spectrum_cache = SpectrumCache(ttl_minutes=60)
 # Grid fijo: 400-4000 cm⁻¹ con paso de 2 cm⁻¹ → 1801 puntos
 FIXED_GRID = np.linspace(400, 4000, 1801, dtype=np.float32)
 
+# Máscara de la región estructural (huella dactilar, 400-1300 cm⁻¹) sobre FIXED_GRID,
+# usada para ponderar el score global (ver STRUCTURAL_WEIGHT en spectral_preprocessing).
+STRUCT_MASK = structural_region_mask(FIXED_GRID)
+
 # ========================================
 # CACHE MATRICIAL DEL DATASET (PRELOADED)
 # Carga todo el dataset en RAM como matriz numpy normalizada.
@@ -115,68 +126,34 @@ class DatasetMatrixCache:
         self.total_loaded: int = 0
 
     # ------------------------------------------------------------------
-    # Interpolación: np.interp es 5x más rápido que scipy.interp1d
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _interpolate_to_grid(wavenumbers: np.ndarray, intensities: np.ndarray) -> Optional[np.ndarray]:
-        if len(wavenumbers) < 2 or len(intensities) < 2:
-            return None
-        try:
-            sort_idx = np.argsort(wavenumbers)
-            wn_s = wavenumbers[sort_idx]
-            ab_s = intensities[sort_idx]
-
-            wn_min, wn_max = float(wn_s[0]), float(wn_s[-1])
-            grid_mask = (FIXED_GRID >= wn_min) & (FIXED_GRID <= wn_max)
-            if int(np.sum(grid_mask)) < 50:
-                return None
-
-            out = np.zeros(len(FIXED_GRID), dtype=np.float32)
-            out[grid_mask] = np.interp(FIXED_GRID[grid_mask], wn_s, ab_s).astype(np.float32)
-            return out
-        except Exception:
-            return None
-
-    # ------------------------------------------------------------------
     # Proceso de una fila (ejecutado en threads)
     # ------------------------------------------------------------------
     @staticmethod
     def _process_row(row) -> Optional[tuple]:
         try:
             spec_data = json.loads(row[1]) if row[1] else {}
-            wn = np.array(spec_data.get("wavenumbers") or [], dtype=np.float32)
-            ab = np.array(
-                spec_data.get("intensities") or spec_data.get("absorbance") or [],
-                dtype=np.float32,
-            )
-            if len(wn) < 2 or len(ab) < 2:
+            wn = spec_data.get("wavenumbers") or []
+            ab = spec_data.get("intensities") or spec_data.get("absorbance") or []
+
+            norm_vec = interpolate_and_preprocess(wn, ab, FIXED_GRID)
+            if norm_vec is None:
                 return None
 
-            sort_idx = np.argsort(wn)
-            wn = wn[sort_idx]; ab = ab[sort_idx]
-
-            wn_min, wn_max = float(wn[0]), float(wn[-1])
-            grid_mask = (FIXED_GRID >= wn_min) & (FIXED_GRID <= wn_max)
-            if int(np.sum(grid_mask)) < 50:
-                return None
-
-            out = np.zeros(len(FIXED_GRID), dtype=np.float32)
-            out[grid_mask] = np.interp(FIXED_GRID[grid_mask], wn, ab).astype(np.float32)
-
-            mn, mx = float(out.min()), float(out.max())
-            if mx - mn < 1e-10:
-                return None
-
-            norm_vec = ((out - mn) / (mx - mn)).astype(np.float32)
             meta = {
                 "spectrum_id": int(row[0]),
                 "sample_code": row[2],
                 "zeolite_name": row[3],
                 "equipment": row[4],
                 "measurement_date": str(row[5]) if row[5] else "N/A",
+                # Código IZA del framework (p.ej. "LTA") — permite al frontend
+                # enlazar cada resultado con GET /api/zeolites/{code}/structure
+                # sin tener que adivinarlo a partir de zeolite_name (que no
+                # siempre incluye el código, p.ej. "Mordenita", "Sodalita").
+                "framework_code": row[6] if len(row) > 6 else None,
             }
             return (norm_vec, meta)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"DatasetMatrixCache._process_row: error procesando fila {row[0] if row else '?'}: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -272,7 +249,7 @@ class DatasetMatrixCache:
 
             cursor = connection.cursor()
             cursor.execute("""
-                SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
+                SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date, zt.structure_type
                 FROM ftir_spectra fs
                 JOIN zeolite_samples zs ON fs.sample_id = zs.id
                 JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
@@ -356,53 +333,26 @@ class DatasetMatrixCache:
         family_filter: Optional[str] = None,
     ) -> List[Dict]:
         """
-        1. Interpola query al FIXED_GRID (np.interp).
-        2. Una operación matricial → similitudes para todos los N espectros.
-        3. Calcula picos solo para los top_n candidatos finales.
+        1. Interpola query al FIXED_GRID (np.interp) + preprocesamiento científico.
+        2. Dos operaciones matriciales (región estructural + resto) → score global
+           ponderado (STRUCTURAL_WEIGHT/1-STRUCTURAL_WEIGHT) para los N espectros.
+        3. Calcula picos y el desglose por ventana Flanigen solo para los top_n
+           candidatos finales, nunca para los N totales (caro de otro modo).
         """
         if not self.loaded or self.matrix is None:
             return []
 
-        sort_idx = np.argsort(query_wn)
-        wn_s = query_wn[sort_idx]; ab_s = query_ab[sort_idx]
-        wn_min, wn_max = float(wn_s[0]), float(wn_s[-1])
-        grid_mask = (FIXED_GRID >= wn_min) & (FIXED_GRID <= wn_max)
-        if int(np.sum(grid_mask)) < 50:
+        # Mismo preprocesamiento (interpolación a FIXED_GRID + máscara CO2 + arPLS +
+        # Savitzky-Golay + SNV) que _process_row aplica al dataset de referencia, y
+        # misma fórmula de similitud — para que query y matriz sean comparables.
+        query_norm = interpolate_and_preprocess(query_wn, query_ab, FIXED_GRID)
+        if query_norm is None:
             return []
 
-        q_interp = np.zeros(len(FIXED_GRID), dtype=np.float32)
-        q_interp[grid_mask] = np.interp(FIXED_GRID[grid_mask], wn_s, ab_s).astype(np.float32)
-
-        mn, mx = float(q_interp.min()), float(q_interp.max())
-        if mx - mn < 1e-10:
+        if method not in ("cosine", "pearson", "euclidean"):
             return []
-        query_norm = ((q_interp - mn) / (mx - mn)).astype(np.float32)
 
-        L = len(FIXED_GRID)
-
-        if method == "cosine":
-            q_norm_val = float(np.linalg.norm(query_norm))
-            if q_norm_val < 1e-10:
-                return []
-            sims = (self.matrix @ query_norm) / (self.norms * q_norm_val + 1e-10)
-            sims = np.clip((sims + 1.0) / 2.0, 0.0, 1.0)
-
-        elif method == "pearson":
-            q_centered = (query_norm - float(np.mean(query_norm))).astype(np.float32)
-            q_std = float(np.std(query_norm))
-            if q_std < 1e-10:
-                return []
-            # mat_centered ya está pre-computado en load() → sin allocaciones extra
-            cov = (self.mat_centered @ q_centered) / L
-            sims = np.clip((cov / (self.stds * q_std + 1e-10) + 1.0) / 2.0, 0.0, 1.0)
-
-        elif method == "euclidean":
-            diffs = self.matrix - query_norm
-            distances = np.linalg.norm(diffs, axis=1) / (np.sqrt(L) + 1e-10)
-            sims = 1.0 / (1.0 + distances)
-
-        else:
-            return []
+        sims = weighted_matrix_similarity(query_norm, self.matrix, method, struct_mask=STRUCT_MASK)
 
         mask = sims >= min_similarity
         if family_filter:
@@ -420,9 +370,11 @@ class DatasetMatrixCache:
         for idx in sorted_idx:
             spec_peaks = detect_peaks_vectorized(FIXED_GRID, self.matrix[idx], threshold=0.05)
             peak_match = match_peaks_vectorized(query_peaks, spec_peaks, tolerance)
+            windowed = compute_window_scores(FIXED_GRID, query_norm, self.matrix[idx], method=method)
             results.append({
                 **self.metadata[idx],
                 "similarity": float(sims[idx]),
+                "window_scores": windowed["window_scores"],
                 "matching_peaks": peak_match["matched_count"],
                 "total_peaks": peak_match["total"],
             })
@@ -495,55 +447,6 @@ def normalize_spectrum(intensities: np.ndarray) -> np.ndarray:
     if max_val - min_val == 0:
         return arr
     return (arr - min_val) / (max_val - min_val)
-
-def normalize_spectra_batch(spectra_list: np.ndarray) -> np.ndarray:
-    """Normalizar múltiples espectros vectorizadamente"""
-    min_vals = np.min(spectra_list, axis=1, keepdims=True)
-    max_vals = np.max(spectra_list, axis=1, keepdims=True)
-    ranges = max_vals - min_vals
-    ranges[ranges == 0] = 1
-    return (spectra_list - min_vals) / ranges
-
-def calculate_similarities_vectorized(
-    ref_spectrum: np.ndarray,
-    test_spectra: List[np.ndarray],
-    method: str = "cosine"
-) -> np.ndarray:
-    """Calcular similitudes vectorizadamente"""
-    try:
-        min_len = min(len(ref_spectrum), min((len(s) for s in test_spectra), default=0))
-        if min_len == 0:
-            return np.array([0.0] * len(test_spectra))
-
-        ref = ref_spectrum[:min_len]
-        test_array = np.array([s[:min_len] for s in test_spectra], dtype=np.float32)
-
-        if method == "cosine":
-            norm_ref = np.linalg.norm(ref)
-            norm_test = np.linalg.norm(test_array, axis=1)
-            dot_products = np.dot(test_array, ref)
-            similarities = dot_products / (norm_ref * norm_test + 1e-10)
-            return np.clip((similarities + 1) / 2, 0, 1)
-
-        elif method == "pearson":
-            ref_centered = ref - np.mean(ref)
-            test_centered = test_array - np.mean(test_array, axis=1, keepdims=True)
-            cov = np.sum(ref_centered * test_centered, axis=1)
-            std_ref = np.std(ref)
-            std_test = np.std(test_array, axis=1)
-            correlations = cov / (std_ref * std_test + 1e-10)
-            return np.clip((correlations + 1) / 2, 0, 1)
-
-        elif method == "euclidean":
-            distances = np.linalg.norm(test_array - ref, axis=1)
-            return 1 / (1 + distances)
-
-        return np.array([0.5] * len(test_spectra))
-
-    except Exception as e:
-        logger.warning(f"⚠️ Error cálculo vectorizado: {e}")
-        return np.array([0.0] * len(test_spectra))
-
 
 # ========================================
 # ✅ FIX CRÍTICO: detect_peaks_vectorized
@@ -674,191 +577,6 @@ def match_peaks_vectorized(
 
 
 # ========================================
-# ✅ FIX: BÚSQUEDA EN DATASET CON WAVENUMBERS REALES
-# ========================================
-
-def search_similar_in_dataset_ultra_fast(
-    spectrum_id: int,
-    method: str = "pearson",
-    top_n: int = 10,
-    min_similarity: float = 0.5,
-    tolerance: float = 4,
-    max_workers: int = 12
-) -> List[Dict]:
-    """
-    ⚡ BÚSQUEDA ULTRA-OPTIMIZADA EN DATASET
-    ✅ FIX: Usa wavenumbers reales para detección de picos
-    """
-    start_time = time.time()
-    connection = None
-    cursor = None
-
-    try:
-        connection = connect_dataset_db()
-        if not connection:
-            logger.warning("⚠️ No hay conexión al dataset")
-            return []
-
-        cursor = connection.cursor()
-
-        cursor.execute("""
-            SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment
-            FROM ftir_spectra fs
-            JOIN zeolite_samples zs ON fs.sample_id = zs.id
-            JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
-            WHERE fs.id = %s
-        """, (spectrum_id,))
-
-        ref_result = cursor.fetchone()
-        if not ref_result:
-            logger.warning(f"⚠️ Espectro de referencia {spectrum_id} no encontrado en dataset")
-            return []
-
-        try:
-            ref_data = json.loads(ref_result[1]) if ref_result[1] else {}
-            ref_intensities = np.array(
-                ref_data.get("intensities") or ref_data.get("absorbance") or [],
-                dtype=np.float32
-            )
-            # ✅ FIX: Cargar wavenumbers reales del espectro de referencia
-            ref_wavenumbers = np.array(
-                ref_data.get("wavenumbers") or list(range(len(ref_intensities))),
-                dtype=np.float32
-            )
-
-            if len(ref_intensities) == 0:
-                logger.warning("⚠️ Espectro de referencia vacío")
-                return []
-        except Exception as e:
-            logger.error(f"❌ Error parseando espectro de referencia: {e}")
-            return []
-
-        ref_intensities_norm = normalize_spectrum(ref_intensities)
-
-        # ✅ FIX: Pasar wavenumbers REALES a detect_peaks
-        ref_peaks = detect_peaks_vectorized(ref_wavenumbers, ref_intensities_norm, threshold=0.05)
-        logger.debug(f"📊 Picos detectados en referencia: {len(ref_peaks)} (en cm⁻¹)")
-
-        cursor.execute("""
-            SELECT fs.id, fs.spectrum_data, zs.sample_code, zt.name, fs.equipment, fs.measurement_date
-            FROM ftir_spectra fs
-            JOIN zeolite_samples zs ON fs.sample_id = zs.id
-            JOIN zeolite_types zt ON zs.zeolite_type_id = zt.id
-            WHERE fs.id != %s
-            LIMIT 5000
-        """, (spectrum_id,))
-
-        all_spectra = cursor.fetchall()
-
-        if not all_spectra:
-            logger.warning("⚠️ No hay espectros en el dataset para comparar")
-            return []
-
-        logger.info(f"📊 Procesando {len(all_spectra)} espectros del dataset")
-
-        similarities = []
-        batch_size = 250
-        batches = [all_spectra[i:i+batch_size] for i in range(0, len(all_spectra), batch_size)]
-
-        def process_batch(batch):
-            batch_results = []
-            try:
-                intensities_list = []
-                wavenumbers_list = []
-                spec_info = []
-
-                for spec_tuple in batch:
-                    try:
-                        spec_data = json.loads(spec_tuple[1]) if spec_tuple[1] else {}
-                        intensities = np.array(
-                            spec_data.get("intensities") or spec_data.get("absorbance") or [],
-                            dtype=np.float32
-                        )
-                        # ✅ FIX: Cargar wavenumbers reales de cada espectro
-                        wavenumbers = np.array(
-                            spec_data.get("wavenumbers") or list(range(len(intensities))),
-                            dtype=np.float32
-                        )
-                        if len(intensities) > 0:
-                            intensities_list.append(intensities)
-                            wavenumbers_list.append(wavenumbers)
-                            spec_info.append(spec_tuple)
-                    except Exception as e:
-                        logger.debug(f"⚠️ Error procesando espectro {spec_tuple[0]}: {e}")
-                        continue
-
-                if not intensities_list:
-                    return batch_results
-
-                max_len = max(len(i) for i in intensities_list)
-                intensities_array = np.array([
-                    np.pad(i, (0, max_len - len(i)), 'constant')
-                    for i in intensities_list
-                ])
-                normalized_batch = normalize_spectra_batch(intensities_array)
-
-                similarities_batch = calculate_similarities_vectorized(
-                    ref_intensities_norm,
-                    [nb for nb in normalized_batch],
-                    method
-                )
-
-                for idx, (similarity, spec_info_tuple) in enumerate(zip(similarities_batch, spec_info)):
-                    if similarity >= min_similarity:
-                        spec_intensities_norm = normalized_batch[idx]
-                        # ✅ FIX: Usar wavenumbers reales del espectro comparado
-                        spec_wn = wavenumbers_list[idx]
-                        spec_peaks = detect_peaks_vectorized(
-                            spec_wn, spec_intensities_norm, threshold=0.05
-                        )
-                        peak_match = match_peaks_vectorized(ref_peaks, spec_peaks, tolerance)
-
-                        batch_results.append({
-                            "spectrum_id": spec_info_tuple[0],
-                            "sample_code": spec_info_tuple[2],
-                            "zeolite_name": spec_info_tuple[3],
-                            "equipment": spec_info_tuple[4],
-                            "measurement_date": str(spec_info_tuple[5]) if spec_info_tuple[5] else "N/A",
-                            "similarity": float(similarity),
-                            "matching_peaks": peak_match["matched_count"],
-                            "total_peaks": peak_match["total"]
-                        })
-            except Exception as e:
-                logger.error(f"❌ Error procesando lote: {e}")
-
-            return batch_results
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_batch, batch) for batch in batches]
-            for future in as_completed(futures):
-                try:
-                    batch_results = future.result()
-                    similarities.extend(batch_results)
-                except Exception as e:
-                    logger.error(f"❌ Error en future: {e}")
-
-        similarities.sort(key=lambda x: x["similarity"], reverse=True)
-        elapsed = time.time() - start_time
-        logger.info(f"⚡ Dataset procesado en {elapsed:.2f}s - {len(similarities)} resultados")
-        return similarities[:top_n]
-
-    except Exception as e:
-        logger.error(f"❌ Error búsqueda dataset: {type(e).__name__}: {str(e)}", exc_info=True)
-        return []
-    finally:
-        if cursor:
-            try:
-                cursor.close()
-            except Exception as e:
-                logger.warning(f"⚠️ Error cerrando cursor: {e}")
-        if connection and connection.is_connected():
-            try:
-                connection.close()
-            except Exception as e:
-                logger.warning(f"⚠️ Error cerrando conexión: {e}")
-
-
-# ========================================
 # ENDPOINTS
 # ========================================
 
@@ -890,82 +608,117 @@ def search_similarity(
         config = request.config
         method = config.method or "pearson"
         tolerance = config.tolerance or 4
-        range_min = config.range_min or 400
-        range_max = config.range_max or 4000
         top_n = config.top_n or 10
+        min_similarity = config.min_similarity if config.min_similarity is not None else 0.5
         family_filter = config.family_filter
+        # Nota: config.range_min/range_max ya no recortan la comparación — el
+        # pipeline unificado siempre trabaja sobre el grid completo FIXED_GRID
+        # (400-4000 cm⁻¹); se aceptan en el request por compatibilidad de API.
 
         results = []
 
-        if len(spectra_to_search) > 0:
+        # Parsear y preprocesar el espectro de consulta UNA vez — se reutiliza tanto
+        # para comparar contra los espectros de usuario como contra el dataset.
+        try:
+            q_raw = json.loads(query_spectrum.wavenumber_data) if query_spectrum.wavenumber_data else {}
+            q_wn = np.array(q_raw.get("wavenumbers") or [], dtype=np.float64)
+            q_ab = np.array(
+                q_raw.get("absorbance") or q_raw.get("intensities") or [],
+                dtype=np.float64
+            )
+            if len(q_wn) == 0 and len(q_ab) > 0:
+                q_wn = np.linspace(400, 4000, len(q_ab))
+        except Exception:
+            q_wn, q_ab = np.array([]), np.array([])
+
+        safe_method = method.lower() if method in ["euclidean", "cosine", "pearson"] else "pearson"
+        query_processed = (
+            interpolate_and_preprocess(q_wn, q_ab, FIXED_GRID)
+            if len(q_wn) > 0 and len(q_ab) > 0 else None
+        )
+
+        # ── Espectros de usuario: MISMO pipeline (FIXED_GRID + preprocesamiento +
+        # vectorized_similarity) que el dataset de referencia, para que ambas
+        # fuentes produzcan scores en la misma escala y sean comparables en un
+        # único ranking. ──
+        if len(spectra_to_search) > 0 and query_processed is not None:
             logger.info(f"⚡ Buscando en {len(spectra_to_search)} espectros del usuario...")
-            user_results = []
+            user_vectors, user_specs = [], []
 
             for spectrum in spectra_to_search:
                 if family_filter and spectrum.material != family_filter:
                     continue
                 try:
-                    similarity_score = calculator.calculate_similarity(
-                        spectrum1=query_spectrum,
-                        spectrum2=spectrum,
-                        method=method,
-                        tolerance=tolerance,
-                        range_min=range_min,
-                        range_max=range_max
+                    s_raw = json.loads(spectrum.wavenumber_data) if spectrum.wavenumber_data else {}
+                    s_wn = np.array(s_raw.get("wavenumbers") or [], dtype=np.float64)
+                    s_ab = np.array(
+                        s_raw.get("absorbance") or s_raw.get("intensities") or [],
+                        dtype=np.float64
                     )
-                    if similarity_score:
-                        user_results.append({
-                            "spectrum_id": spectrum.id,
-                            "filename": spectrum.filename,
-                            "family": spectrum.material or "N/D",
-                            "global_score": similarity_score.get("global_score", 0),
-                            "window_scores": similarity_score.get("window_scores", []),
-                            "matching_peaks": similarity_score.get("matching_peaks", 0),
-                            "total_peaks": similarity_score.get("total_peaks", 0),
-                            "source": "user_database",
-                            "rank": 0
-                        })
+                    if len(s_wn) == 0 and len(s_ab) > 0:
+                        s_wn = np.linspace(400, 4000, len(s_ab))
+                    vec = interpolate_and_preprocess(s_wn, s_ab, FIXED_GRID)
+                    if vec is None:
+                        continue
+                    user_vectors.append(vec)
+                    user_specs.append(spectrum)
                 except Exception as e:
-                    logger.debug(f"⚠️ Error comparando espectro {spectrum.id}: {e}")
+                    logger.debug(f"⚠️ Error procesando espectro de usuario {spectrum.id}: {e}")
 
-            results.extend(user_results)
+            if user_vectors:
+                user_matrix = np.array(user_vectors, dtype=np.float32)
+                # Score ponderado por ventanas Flanigen (mismo criterio que el dataset)
+                user_sims = weighted_matrix_similarity(query_processed, user_matrix, safe_method, struct_mask=STRUCT_MASK)
+                query_peaks = detect_peaks_vectorized(FIXED_GRID, query_processed, threshold=0.05)
+                for spectrum, vec, sim in zip(user_specs, user_vectors, user_sims):
+                    spec_peaks = detect_peaks_vectorized(FIXED_GRID, vec, threshold=0.05)
+                    peak_match = match_peaks_vectorized(query_peaks, spec_peaks, tolerance)
+                    windowed = compute_window_scores(FIXED_GRID, query_processed, vec, method=safe_method)
+                    # Best-effort: si el usuario escribió directamente un código IZA
+                    # (p.ej. "LTA") en material, lo pasamos tal cual — el endpoint de
+                    # estructura simplemente devuelve 404 si no matchea nada real.
+                    material = (spectrum.material or "").strip()
+                    guessed_code = material.upper() if material.isalpha() and 2 <= len(material) <= 6 else None
+                    results.append({
+                        "spectrum_id": spectrum.id,
+                        "filename": spectrum.filename,
+                        "family": spectrum.material or "N/D",
+                        "framework_code": guessed_code,
+                        "global_score": float(sim),
+                        "window_scores": windowed["window_scores"],
+                        "matching_peaks": peak_match["matched_count"],
+                        "total_peaks": peak_match["total"],
+                        "source": "user_database",
+                        "rank": 0
+                    })
 
         logger.info(f"⚡ Iniciando búsqueda en dataset...")
 
-        # Parsear el espectro query para la búsqueda en dataset
-        try:
-            q_raw = json.loads(query_spectrum.wavenumber_data) if query_spectrum.wavenumber_data else {}
-            q_wn = np.array(q_raw.get("wavenumbers") or [], dtype=np.float32)
-            q_ab = np.array(
-                q_raw.get("absorbance") or q_raw.get("intensities") or [],
-                dtype=np.float32
-            )
-            if len(q_wn) == 0 and len(q_ab) > 0:
-                q_wn = np.linspace(400, 4000, len(q_ab), dtype=np.float32)
-        except Exception:
-            q_wn, q_ab = np.array([]), np.array([])
-
-        safe_method = method.lower() if method in ["euclidean", "cosine", "pearson"] else "pearson"
-
-        if dataset_matrix_cache.loaded and len(q_wn) > 0 and len(q_ab) > 0:
+        # ── Dataset de referencia: siempre vía el caché matricial. Si aún no ha
+        # terminado de cargar, se responde 503+Retry-After en vez de recaer en una
+        # ruta de respaldo que comparaba espectros por índice de array (ignorando
+        # los números de onda) — resultados que no eran científicamente válidos. ──
+        if not dataset_matrix_cache.loaded:
+            logger.warning("⚠️ Cache matricial no cargado todavía")
+            if not results:
+                raise HTTPException(
+                    status_code=503,
+                    detail="El motor de búsqueda del dataset todavía está cargando. Reintenta en unos segundos.",
+                    headers={"Retry-After": "5"},
+                )
+            dataset_results = []
+        elif query_processed is None:
+            logger.warning("⚠️ Espectro de consulta sin datos válidos para buscar en el dataset")
+            dataset_results = []
+        else:
             logger.info("⚡ Usando cache matricial (búsqueda instantánea)")
             dataset_results = dataset_matrix_cache.search(
                 q_wn, q_ab,
                 method=safe_method,
-                min_similarity=0.5,
+                min_similarity=min_similarity,
                 top_n=top_n,
                 tolerance=tolerance,
                 family_filter=family_filter,
-            )
-        else:
-            logger.info("⚠️ Cache no cargado, usando búsqueda tradicional")
-            dataset_results = search_similar_in_dataset_ultra_fast(
-                request.query_spectrum_id,
-                method=safe_method,
-                top_n=top_n,
-                min_similarity=0.5,
-                tolerance=tolerance,
-                max_workers=12,
             )
 
         for result in dataset_results:
@@ -973,8 +726,9 @@ def search_similarity(
                 "spectrum_id": result["spectrum_id"],
                 "filename": f"{result['sample_code']} ({result['zeolite_name']})",
                 "family": result["zeolite_name"],
+                "framework_code": result.get("framework_code"),
                 "global_score": result["similarity"],
-                "window_scores": [],
+                "window_scores": result.get("window_scores", []),
                 "matching_peaks": result.get("matching_peaks", 0),
                 "total_peaks": result.get("total_peaks", 0),
                 "source": "zeolite_dataset",
@@ -990,6 +744,28 @@ def search_similarity(
         execution_time_ms = int((time.time() - start_time) * 1000)
         logger.info(f"✅ Búsqueda completada en {execution_time_ms}ms")
 
+        # Persistir el historial de búsqueda (best-effort: un fallo aquí no debe
+        # impedir devolver los resultados ya calculados al usuario).
+        try:
+            db.add(SimilarityResultModel(
+                user_id=current_user.id,
+                query_spectrum_id=request.query_spectrum_id,
+                search_method=safe_method,
+                tolerance=tolerance,
+                top_n=top_n,
+                min_similarity=min_similarity,
+                family_filter=family_filter,
+                results=results,
+                total_spectra_searched=len(spectra_to_search) + len(dataset_results),
+                execution_time_ms=float(execution_time_ms),
+                results_found=len(results),
+                algorithm_version=ALGORITHM_VERSION,
+            ))
+            db.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo persistir el historial de búsqueda: {e}")
+            db.rollback()
+
         return {
             "success": True,
             "message": "Búsqueda completada",
@@ -1004,7 +780,9 @@ def search_similarity(
                 "user_results": sum(1 for r in results if r.get("source") == "user_database"),
                 "dataset_results": sum(1 for r in results if r.get("source") == "zeolite_dataset"),
                 "execution_time_ms": execution_time_ms,
-                "searched_at": datetime.now().isoformat()
+                "searched_at": datetime.now().isoformat(),
+                "min_similarity": min_similarity,
+                "algorithm_version": ALGORITHM_VERSION,
             }
         }
 
@@ -1012,7 +790,7 @@ def search_similarity(
         raise
     except Exception as e:
         logger.error(f"❌ Error en búsqueda: {type(e).__name__}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error en búsqueda: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error en búsqueda")
 
 
 @router.post("/compare")
@@ -1120,8 +898,8 @@ def compare_spectra(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error comparación: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Error comparación: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error en comparación de espectros")
 
 
 # ========================================
@@ -1239,7 +1017,7 @@ def get_spectrum_for_comparison(
         raise
     except Exception as e:
         logger.error(f"❌ Error: {type(e).__name__}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error obteniendo espectro para comparación")
     finally:
         if connection and connection.is_connected():
             try:
@@ -1336,7 +1114,7 @@ def get_dataset_spectra(
         raise
     except Exception as e:
         logger.error(f"❌ Error obteniendo dataset: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error obteniendo dataset")
     finally:
         if cursor:
             try: cursor.close()
@@ -1421,7 +1199,7 @@ def get_spectrum_info(spectrum_id: int, current_user: User = Depends(get_current
         raise
     except Exception as e:
         logger.error(f"❌ Error obteniendo espectro: {type(e).__name__}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Error obteniendo espectro")
     finally:
         if cursor:
             try:
@@ -1455,7 +1233,7 @@ def get_cache_status(current_user: User = Depends(get_current_user)):
 
 
 @router.post("/cache/reload")
-def reload_cache(current_user: User = Depends(get_current_user)):
-    """Fuerza la recarga del cache matricial en segundo plano."""
+def reload_cache(current_user: User = Depends(require_admin)):
+    """Fuerza la recarga del cache matricial en segundo plano. Solo administradores."""
     dataset_matrix_cache.reload()
     return {"message": "Recarga del cache iniciada en segundo plano"}

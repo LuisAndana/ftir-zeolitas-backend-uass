@@ -8,6 +8,7 @@ __pycache__/
 
 # ── Entornos virtuales ────────────────────
 .venv/
+.venv_run/
 venv/
 env/
 ENV/
@@ -21,6 +22,9 @@ ENV/
 *.db
 *.sqlite
 *.sqlite3
+
+# ── Grafo de conocimiento (regenerable con /graphify .) ──
+graphify-out/
 
 # ── Cache y archivos grandes ──────────────
 cache/
@@ -50,6 +54,11 @@ logs/
 dist/
 build/
 *.egg-info/
+
+# ── Tests ─────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
 
 # ── OS ────────────────────────────────────
 .DS_Store

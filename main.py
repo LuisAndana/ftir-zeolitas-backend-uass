@@ -194,7 +194,7 @@ async def shutdown_event():
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     """Manejador global de excepciones"""
-    logger.error(f"❌ Error: {exc}")
+    logger.error(f"❌ Error: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={

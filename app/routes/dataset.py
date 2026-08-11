@@ -3,7 +3,7 @@ Rutas para gestión del dataset de zeolitas FTIR
 """
 
 import logging
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import Optional
 from datetime import datetime
 
@@ -12,6 +12,8 @@ from app.models.dataset_models import (
     DatasetStatus, DatasetSummary, LoadDatasetResponse, ClearDatasetResponse
 )
 from app.core.config import settings
+from app.models.user import User
+from app.routes.admin import require_admin
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -58,7 +60,10 @@ def _get_summary() -> DatasetSummary:
     summary="Cargar dataset completo",
     tags=["dataset"]
 )
-async def load_dataset(background_tasks: BackgroundTasks):
+async def load_dataset(
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_admin)
+):
     """
     Cargar dataset completo de zeolitas FTIR
 
@@ -154,7 +159,7 @@ async def load_dataset(background_tasks: BackgroundTasks):
     summary="Estado de la carga",
     tags=["dataset"]
 )
-async def get_status():
+async def get_status(current_user: User = Depends(require_admin)):
     """Obtener estado actual de la carga del dataset"""
 
     summary = _loader_state.get("last_summary") or _get_summary()
@@ -188,7 +193,7 @@ async def get_status():
     summary="Resumen del dataset",
     tags=["dataset"]
 )
-async def get_summary():
+async def get_summary(current_user: User = Depends(require_admin)):
     """Obtener resumen del dataset actual"""
 
     summary = _get_summary()
@@ -206,7 +211,7 @@ async def get_summary():
     summary="Limpiar dataset",
     tags=["dataset"]
 )
-async def clear_dataset():
+async def clear_dataset(current_user: User = Depends(require_admin)):
     """
     ⚠️ ADVERTENCIA: Elimina TODOS los datos del dataset
 
@@ -247,5 +252,5 @@ async def clear_dataset():
         logger.error(f"Error limpiando dataset: {e}")
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail="Error limpiando dataset"
         )

@@ -4,7 +4,7 @@ Rutas para carga y gestión de espectros - CON MANEJO DE ERRORES MEJORADO Y LOGS
 
 import logging
 import json
-from fastapi import APIRouter, Depends, File, UploadFile, Query, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, UploadFile, Query, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from typing import Optional
@@ -129,7 +129,7 @@ def get_spectra(
         logger.error(f"❌ Error general obteniendo espectros: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error obteniendo espectros: {str(e)}"
+            detail="Error obteniendo espectros"
         )
 
 
@@ -146,11 +146,11 @@ def get_spectra(
 )
 async def upload_spectrum(
     file: UploadFile = File(...),
-    filename: Optional[str] = None,
-    material: Optional[str] = None,
-    technique: Optional[str] = None,
-    hydration_state: Optional[str] = None,
-    temperature: Optional[str] = None,
+    filename: Optional[str] = Form(None),
+    material: Optional[str] = Form(None),
+    technique: Optional[str] = Form(None),
+    hydration_state: Optional[str] = Form(None),
+    temperature: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -245,7 +245,7 @@ async def upload_spectrum(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al cargar espectro: {str(e)}"
+            detail="Error al cargar espectro"
         )
 
 
@@ -375,51 +375,156 @@ def delete_spectrum(
 
 def parse_spectrum_file(content: bytes, filename: str) -> dict:
     """
-    Parsear archivo de espectro en múltiples formatos
+    Parsear archivo de espectro FTIR. Formatos soportados, en orden de detección:
+      1. JCAMP-DX (.jdx/.dx/.jcm, o contenido que empieza por '##') — estándar
+         IUPAC de intercambio para espectroscopía, vía la librería `jcamp`.
+      2. CSV/TSV (.csv/.tsv, o contenido con comas/punto-y-coma detectado) — con
+         sniffer de delimitador (csv.Sniffer).
+      3. Texto plano de dos columnas separadas por espacios (formato original,
+         fallback final — nunca se deja de soportar).
     Retorna: {"wavenumbers": [...], "absorbance": [...]}
     """
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
 
     try:
-        # Intentar como texto
+        if ext in ('jdx', 'dx', 'jcm'):
+            return _parse_jcamp_dx(content)
+
         text_content = content.decode('utf-8', errors='ignore')
-        lines = text_content.split('\n')
 
-        wavenumbers = []
-        absorbance = []
+        if text_content.lstrip().startswith('##'):
+            # No tiene extensión JCAMP-DX pero el contenido sí lo es
+            return _parse_jcamp_dx(content)
 
-        for line in lines:
-            line = line.strip()
+        if ext in ('csv', 'tsv'):
+            return _parse_delimited_text(text_content)
 
-            # Saltar líneas vacías o comentarios
-            if not line or line.startswith('#'):
-                continue
+        # Sniff: ¿las primeras líneas de datos usan coma o punto y coma?
+        sample_lines = [l for l in text_content.split('\n')[:20] if l.strip() and not l.strip().startswith('#')]
+        if sample_lines and any(',' in l or ';' in l for l in sample_lines[:3]):
+            try:
+                return _parse_delimited_text(text_content)
+            except ValueError:
+                pass  # no era CSV válido pese a tener comas -> cae al parser de espacios
 
-            # Parsear números
-            parts = line.split()
+        result = _parse_whitespace_columns(text_content)
+        logger.info(f"✅ Archivo parseado (texto plano): {len(result['wavenumbers'])} puntos")
+        return result
 
-            if len(parts) >= 2:
-                try:
-                    # Intentar parsear últimos 2 números
-                    wn = float(parts[-2])
-                    abs_val = float(parts[-1])
-
-                    # Validar rangos razonables
-                    if 0 < wn < 5000 and (0 <= abs_val <= 1 or 0 <= abs_val <= 100):
-                        wavenumbers.append(wn)
-                        absorbance.append(abs_val)
-                except (ValueError, IndexError):
-                    continue
-
-        if not wavenumbers or not absorbance:
-            raise ValueError("No se encontraron datos válidos en el archivo")
-
-        logger.info(f"✅ Archivo parseado: {len(wavenumbers)} puntos")
-
-        return {
-            "wavenumbers": wavenumbers,
-            "absorbance": absorbance
-        }
-
+    except ValueError:
+        raise
     except Exception as e:
         logger.error(f"❌ Error parseando archivo: {e}", exc_info=True)
         raise ValueError(f"Error al parsear archivo: {str(e)}")
+
+
+def _transmittance_to_absorbance(values, is_percent: bool) -> list:
+    """A = -log10(T). Acepta T en [0,1] (is_percent=False) o %T en [0,100]."""
+    import math
+    out = []
+    for v in values:
+        t = (v / 100.0) if is_percent else v
+        t = max(t, 1e-6)  # evita log10(0)/log10(negativo) con ruido de medida
+        out.append(-math.log10(t))
+    return out
+
+
+def _parse_jcamp_dx(content: bytes) -> dict:
+    """
+    Parsea JCAMP-DX (formatos XY comprimidos X++(Y..Y), SQZ/DIF/DUP, y XY simple)
+    vía la librería `jcamp`, que ya implementa el estándar completo (evita
+    reinventar un parser de compresión de caracteres propenso a errores).
+    Convierte a absorbancia si el archivo reporta %Transmitancia/Transmitancia.
+    """
+    import io
+    import jcamp as jcamp_lib
+
+    try:
+        data = jcamp_lib.read(io.BytesIO(content))
+    except Exception as e:
+        raise ValueError(f"Error parseando JCAMP-DX: {e}")
+
+    x = data.get('x')
+    y = data.get('y')
+    if x is None or y is None or len(x) == 0 or len(x) != len(y):
+        raise ValueError("El archivo JCAMP-DX no contiene un bloque XYDATA/XYPOINTS válido")
+
+    wavenumbers = [float(v) for v in x]
+    absorbance = [float(v) for v in y]
+
+    yunits = str(data.get('yunits', '')).upper()
+    if 'TRANSMITTANCE' in yunits:
+        is_percent = '%' in yunits or (max(absorbance, default=0.0) > 1.5)
+        absorbance = _transmittance_to_absorbance(absorbance, is_percent)
+        logger.info(f"   Convertido {'%' if is_percent else ''}Transmitancia -> Absorbancia")
+
+    logger.info(f"✅ JCAMP-DX parseado: {len(wavenumbers)} puntos "
+                f"(xunits={data.get('xunits','?')}, yunits={data.get('yunits','?')})")
+    return {"wavenumbers": wavenumbers, "absorbance": absorbance}
+
+
+def _parse_delimited_text(text_content: str) -> dict:
+    """CSV/TSV con sniffer de delimitador (coma, punto y coma, tabulador). Ignora
+    líneas de cabecera no numéricas y comentarios (#)."""
+    import csv
+    import io
+
+    lines = [l for l in text_content.split('\n') if l.strip() and not l.strip().startswith('#')]
+    if not lines:
+        raise ValueError("Archivo vacío o sin datos")
+
+    try:
+        dialect = csv.Sniffer().sniff('\n'.join(lines[:10]), delimiters=',;\t')
+    except csv.Error:
+        dialect = csv.excel  # fallback: coma
+
+    wavenumbers, absorbance = [], []
+    for row in csv.reader(lines, dialect):
+        if len(row) < 2:
+            continue
+        try:
+            # Con delimitador ';' es común la coma como separador decimal (CSV europeo)
+            wn_raw = row[0].strip()
+            ab_raw = row[-1].strip()
+            if dialect.delimiter != ',':
+                wn_raw = wn_raw.replace(',', '.')
+                ab_raw = ab_raw.replace(',', '.')
+            wn = float(wn_raw)
+            ab = float(ab_raw)
+        except ValueError:
+            continue  # fila de cabecera u otro contenido no numérico
+
+        if 0 < wn < 5000:
+            wavenumbers.append(wn)
+            absorbance.append(ab)
+
+    if not wavenumbers:
+        raise ValueError("No se encontraron datos numéricos válidos en el CSV/TSV")
+
+    logger.info(f"✅ CSV/TSV parseado (delimitador '{dialect.delimiter}'): {len(wavenumbers)} puntos")
+    return {"wavenumbers": wavenumbers, "absorbance": absorbance}
+
+
+def _parse_whitespace_columns(text_content: str) -> dict:
+    """Texto plano de dos columnas separadas por espacios — formato original,
+    se mantiene como fallback final para no romper archivos ya soportados."""
+    wavenumbers, absorbance = [], []
+    for line in text_content.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                wn = float(parts[-2])
+                abs_val = float(parts[-1])
+                if 0 < wn < 5000 and (0 <= abs_val <= 1 or 0 <= abs_val <= 100):
+                    wavenumbers.append(wn)
+                    absorbance.append(abs_val)
+            except (ValueError, IndexError):
+                continue
+
+    if not wavenumbers or not absorbance:
+        raise ValueError("No se encontraron datos válidos en el archivo")
+
+    return {"wavenumbers": wavenumbers, "absorbance": absorbance}

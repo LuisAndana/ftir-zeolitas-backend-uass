@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # SERVIDOR
     # ========================================
     environment: str = os.getenv("ENVIRONMENT", "development")
-    debug: bool = os.getenv("DEBUG", "True").lower() == "true"
+    debug: bool = os.getenv("DEBUG", "False").lower() == "true"
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     # ========================================
