@@ -346,3 +346,57 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     Ninguna de las dos se implementó esta sesión — ambas requieren datos que el usuario todavía no ha
     proporcionado (espectros de referencia medidos, o difractogramas). Ver también pendiente #10 (máscara
     de validez) y la limitación ya documentada arriba: "Dataset 100% sintético... no discrimina familias".
+19. ✅ Hecho (2026-08-11/12): **eliminar espectro con historial de búsquedas asociado, formatos no
+    soportados en la subida, y auditoría de mensajes de error backend↔frontend** — a partir de un
+    traceback real del usuario (`IntegrityError` al hacer `DELETE /spectra/{id}`).
+    - **Bug real: `DELETE /spectra/{id}` fallaba con 500 si el espectro ya tenía una búsqueda de
+      similitud guardada.** `similarity_results.query_spectrum_id` (FK a `spectra.id`) no tenía
+      `ondelete` definido → MySQL rechazaba el DELETE (`IntegrityError 1451`). Fix: `ondelete="CASCADE"`
+      en el modelo (`app/models/similarity_result.py`) + migración `f20fcc4f3e94` (DROP/CREATE de la FK
+      `similarity_results_ibfk_2` con `ON DELETE CASCADE`), aplicada contra la BD real y verificada
+      (`DELETE_RULE='CASCADE'` en `information_schema.REFERENTIAL_CONSTRAINTS`). Borrar un espectro ahora
+      borra en cascada su historial de búsquedas — no tiene sentido sin el espectro que lo originó.
+      Catch defensivo adicional de `IntegrityError` en `delete_spectrum` (409, mensaje claro) por si en el
+      futuro otra tabla referencia `spectra.id` sin cascada. 2 tests nuevos en `tests/test_spectrum_deletion.py`
+      (cascada real contra SQLite con `PRAGMA foreign_keys=ON`, y regresión del caso sin historial).
+    - **Formatos sin parser real (`.xlsx`, `.json`, ofrecidos por el selector de archivos del frontend
+      pero nunca soportados) fallaban con "no se encontraron datos numéricos válidos" — engañoso para un
+      binario, y además se devolvía como 500 genérico, no 422.** `parse_spectrum_file`
+      (`app/routes/spectra.py`) ahora rechaza explícitamente `UNSUPPORTED_EXTENSIONS` (xlsx, xls, json,
+      pdf, doc, docx, png, jpg, jpeg) con un mensaje que nombra el formato y lista los soportados
+      (JCAMP-DX, CSV/TSV, texto plano). `upload_spectrum` captura `ValueError` de `parse_spectrum_file` y
+      lo expone como 422 con el mensaje real, en vez de caer al catch-all genérico (500 "Error al cargar
+      espectro"). Frontend: `cargar-espectro.html` quitó `.json`/`.xlsx` del `accept` del input de
+      archivo (nunca funcionaron) y agregó tarjetas informativas para CSV/TSV y JCAMP-DX (soportados pero
+      no documentados antes) más una nota explícita de formatos no compatibles. 4 tests nuevos en
+      `tests/test_spectrum_parsing.py` + 1 en `tests/test_spectrum_auto_classification.py` (ruta
+      `upload_spectrum` completa, vía `asyncio.run` — el proyecto no tiene `pytest-asyncio` configurado,
+      se evitó agregarlo por una sola prueba).
+    - **Bug real encontrado al auditar: `spectra-backend.service.ts` (frontend) NUNCA leía
+      `error.error.detail` del backend** — hardcodeaba un mensaje genérico por código HTTP (404/401/403/
+      500) y para cualquier otro código (como los 422/409 nuevos) mostraba
+      `Error ${status}: ${error.message}` (el `.message` genérico de Angular, tipo "Http failure
+      response for ...", NO el mensaje del backend). Esto habría hecho invisibles todos los mensajes
+      claros agregados en esta sesión. Corregido para priorizar `error.error.detail` (mismo patrón ya
+      usado correctamente en `similarity-backend.service.ts`/`zeolites.service.ts`/
+      `auth-backend.service.ts`, que no se tocaron por ya estar bien). Además, `cargar-espectro.ts` tenía
+      una SEGUNDA capa de traducción (`getErrorMessage`) que pisaba el mensaje específico de 422/500 con
+      uno genérico propio — simplificada para confiar en el mensaje ya final del servicio
+      (`error?.message`).
+    - **Bug de diseño real: `.queue-message` en `cargar-espectro.css` tenía `white-space: nowrap` sin
+      max-width, dentro de una fila con `overflow: hidden`** — un mensaje de error largo y claro (el
+      objetivo mismo de esta sesión) se habría cortado en silencio. Fix: los mensajes de error ahora se
+      muestran en `.queue-error-message`, una fila completa propia (mismo patrón `grid-column: 1 / -1`
+      que ya usa `.queue-suggestion`) con `white-space: normal` para que el texto envuelva.
+    - Auditoría del resto de `raise HTTPException` en `app/routes/` (51 en total): reescritos los
+      genéricos poco accionables ("Error en base de datos", "Error obteniendo dataset", etc.) a mensajes
+      en español que dicen qué falló y qué hacer, en `spectra.py`, `similarity.py`, `dataset.py`,
+      `zeolites.py`. `admin.py` y `auth.py` ya estaban en buen estado — **no tocar**
+      `detail="EMAIL_NOT_VERIFIED"`/`"ACCOUNT_PENDING_APPROVAL"` en `auth.py`: son sentinels literales que
+      `login-modal.ts` compara con `===` para decidir qué UI mostrar, no texto para el usuario.
+    Suite completa: 146 tests pasan (137 + 9 nuevos). Verificado end-to-end con curl contra el servidor
+    real (`127.0.0.1:8000`, main, tras merge): `DELETE` de un espectro con historial real → 200 y
+    cascada confirmada en BD; subida de `.xlsx` → 422 con el mensaje exacto esperado. **No verificado con
+    clic real en el navegador** (mismo bloqueo de seguridad que el pendiente #17: el harness no permite
+    escribir credenciales en el formulario de login) — sí se confirmó que el frontend compila sin errores
+    nuevos en consola tras los cambios de HTML/CSS/TS.
