@@ -132,3 +132,26 @@ def test_jcamp_dx_transmittance_converted_to_absorbance():
 def test_jcamp_dx_malformed_raises_value_error():
     with pytest.raises(ValueError):
         parse_spectrum_file(b"##TITLE=broken\n##NOT A VALID JCAMP FILE AT ALL\n", "spectrum.jdx")
+
+
+# ---------------------------------------------------------------------------
+# Formatos explícitamente no soportados — deben rechazarse de inmediato con
+# un mensaje claro que nombre el formato, en vez de caer en "sin datos
+# válidos" (mensaje engañoso para un binario como .xlsx) o un 500 genérico.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("filename", ["datos.xlsx", "datos.xls", "datos.json", "informe.pdf", "foto.png"])
+def test_unsupported_format_raises_clear_value_error(filename):
+    with pytest.raises(ValueError) as exc_info:
+        parse_spectrum_file(b"contenido irrelevante para este test", filename)
+    message = str(exc_info.value)
+    assert "no es compatible" in message
+    assert "JCAMP-DX" in message and "CSV" in message  # menciona alternativas soportadas
+
+
+def test_xlsx_binary_content_rejected_before_attempting_to_decode():
+    """Un .xlsx real es un ZIP binario — nunca debe intentar decodificarlo
+    como texto, debe rechazarse por extensión antes de llegar ahí."""
+    fake_xlsx_binary = b"PK\x03\x04" + bytes(range(200))  # firma ZIP + basura binaria
+    with pytest.raises(ValueError, match="no es compatible"):
+        parse_spectrum_file(fake_xlsx_binary, "espectro.xlsx")

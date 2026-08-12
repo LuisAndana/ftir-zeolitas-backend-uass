@@ -19,7 +19,10 @@ class SimilarityResult(Base):
     # Identificador
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    query_spectrum_id = Column(Integer, ForeignKey("spectra.id"), nullable=False)
+    # ondelete=CASCADE: si se borra el espectro de consulta, el historial de
+    # búsquedas que lo referencian ya no tiene sentido por sí solo (ver
+    # migración 'similarity_results_cascade_delete_query_spectrum').
+    query_spectrum_id = Column(Integer, ForeignKey("spectra.id", ondelete="CASCADE"), nullable=False)
 
     # Configuración de búsqueda
     search_method = Column(String(50), default="cosine")  # cosine, pearson, euclidean

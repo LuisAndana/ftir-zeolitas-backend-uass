@@ -326,3 +326,23 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     de la UI requiere escribir credenciales en el formulario, acción que el harness bloquea por política
     de seguridad (entrada de credenciales en campos de login); pendiente que el usuario confirme
     visualmente el badge en su propia sesión autenticada.
+18. **PENDIENTE — mejoras para exactitud científica real, no solo transparencia sobre la incertidumbre**
+    (surgió al verificar manualmente si un espectro real de laboratorio, "EL-17 Cu00", correspondía a la
+    familia MWW que la auto-clasificación le asignó con 69% de confianza — la banda diagnóstica principal
+    del espectro real, 999 cm⁻¹, no calzaba ni con el valor sintético de MWW (~1042 cm⁻¹) ni con literatura
+    real de MCM-22 (~1090-1230 cm⁻¹), aunque otras bandas sí coincidían razonablemente):
+    - **Reemplazar el dataset sintético por espectros reales de referencia — cambio de mayor impacto.**
+      Cada "familia" hoy es una fórmula matemática (`asymmetric_stretch_cm1`, `ring_band_for_framework`
+      en `zeolite_dataset_loader.py`), no una medición real; por eso las posiciones de banda pueden
+      desviarse de literatura para frameworks no verificados individualmente (solo LTA=592 y FAU=555 en
+      `VERIFIED_RING_BAND_CM1` están confirmados por fuente). Si el usuario tiene acceso a estándares
+      comerciales o muestras de composición conocida (p.ej. zeolita Y, ZSM-5, mordenita, ferrierita —
+      típicas en catálisis Cu-SCR), medirlas y cargarlas como referencia verificada movería el sistema de
+      "aproximación matemática" a "comparación real". Requiere trabajo de datos del usuario, no solo código.
+    - **Complementar con una técnica ortogonal — XRD como estándar de oro para identificar framework.**
+      FTIR solo mide entorno vibracional T-O-T local; nunca distingue con certeza total entre familias de
+      topología similar. Si hay (o se pueden conseguir) difractogramas XRD de las muestras, podrían usarse
+      para confirmar/descartar la sugerencia de FTIR en vez de depender de una sola técnica.
+    Ninguna de las dos se implementó esta sesión — ambas requieren datos que el usuario todavía no ha
+    proporcionado (espectros de referencia medidos, o difractogramas). Ver también pendiente #10 (máscara
+    de validez) y la limitación ya documentada arriba: "Dataset 100% sintético... no discrimina familias".

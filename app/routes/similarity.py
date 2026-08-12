@@ -790,7 +790,10 @@ def search_similarity(
         raise
     except Exception as e:
         logger.error(f"❌ Error en búsqueda: {type(e).__name__}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error en búsqueda")
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudo completar la búsqueda de similitud. Intenta de nuevo en unos segundos."
+        )
 
 
 @router.post("/compare")
@@ -817,7 +820,10 @@ def compare_spectra(
         ).first()
 
         if not query_spectrum or not reference_spectrum:
-            raise HTTPException(status_code=404, detail="Espectros no encontrados")
+            raise HTTPException(
+                status_code=404,
+                detail="No encontramos uno de los dos espectros a comparar. Puede que ya haya sido eliminado."
+            )
 
         # ✅ FIX: Calcular picos con wavenumbers reales antes de enviar al calculator
         try:
@@ -856,7 +862,10 @@ def compare_spectra(
         )
 
         if not similarity_score:
-            raise HTTPException(status_code=500, detail="Error calculando similitud")
+            raise HTTPException(
+                status_code=500,
+                detail="No se pudo calcular la similitud entre estos dos espectros. Intenta de nuevo."
+            )
 
         # ✅ Enriquecer con picos calculados correctamente si el calculator no los tiene
         matched_peaks = similarity_score.get("matched_peaks") or peak_match["matched"]
@@ -899,7 +908,10 @@ def compare_spectra(
         raise
     except Exception as e:
         logger.error(f"❌ Error comparación: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error en comparación de espectros")
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudo completar la comparación de espectros. Intenta de nuevo en unos segundos."
+        )
 
 
 # ========================================
@@ -1017,7 +1029,10 @@ def get_spectrum_for_comparison(
         raise
     except Exception as e:
         logger.error(f"❌ Error: {type(e).__name__}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error obteniendo espectro para comparación")
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudo cargar el espectro para la comparación. Intenta de nuevo."
+        )
     finally:
         if connection and connection.is_connected():
             try:
@@ -1073,7 +1088,10 @@ def get_dataset_spectra(
     try:
         connection = connect_dataset_db()
         if not connection:
-            raise HTTPException(status_code=500, detail="No se pudo conectar al dataset")
+            raise HTTPException(
+                status_code=500,
+                detail="No se pudo conectar con el dataset de referencia. Intenta de nuevo en unos segundos."
+            )
 
         cursor = connection.cursor()
         cursor.execute("SELECT COUNT(*) FROM ftir_spectra")
@@ -1114,7 +1132,10 @@ def get_dataset_spectra(
         raise
     except Exception as e:
         logger.error(f"❌ Error obteniendo dataset: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error obteniendo dataset")
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudo cargar la lista del dataset de referencia. Intenta de nuevo en unos segundos."
+        )
     finally:
         if cursor:
             try: cursor.close()
@@ -1161,7 +1182,10 @@ def get_spectrum_info(spectrum_id: int, current_user: User = Depends(get_current
     try:
         connection = connect_dataset_db()
         if not connection:
-            raise HTTPException(status_code=500, detail="No se pudo conectar a la base de datos")
+            raise HTTPException(
+                status_code=500,
+                detail="No se pudo conectar con el dataset de referencia. Intenta de nuevo en unos segundos."
+            )
 
         cursor = connection.cursor()
         cursor.execute("""
@@ -1199,7 +1223,10 @@ def get_spectrum_info(spectrum_id: int, current_user: User = Depends(get_current
         raise
     except Exception as e:
         logger.error(f"❌ Error obteniendo espectro: {type(e).__name__}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Error obteniendo espectro")
+        raise HTTPException(
+            status_code=500,
+            detail="No se pudo cargar el espectro del dataset. Intenta de nuevo en unos segundos."
+        )
     finally:
         if cursor:
             try:
