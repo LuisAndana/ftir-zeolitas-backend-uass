@@ -296,3 +296,33 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
       `tests/test_zeolite_structure.py` (directos/alias/sin-CIF-permanente). Verificado en navegador
       real: canvas WebGL con contenido no-blanco para Laumontita (antes mostraba el fallback "CIF aún
       no descargado").
+17. ✅ Hecho (2026-08-11): **auto-clasificación de familia al subir un espectro sin material** — antes
+    todo espectro subido sin campo material explícito quedaba "Desconocido" para siempre y el visor 3D
+    exigía elegir la familia a mano. `app/routes/spectra.py` añade `_suggest_family(wavenumbers,
+    absorbance)`: si `dataset_matrix_cache.loaded`, reutiliza el MISMO motor que `/search`
+    (`dataset_matrix_cache.search(..., method="cosine", min_similarity=0.5, top_n=1)`) para comparar el
+    espectro recién subido contra el dataset de referencia; best-effort (cualquier excepción se loguea y
+    devuelve `None`, nunca rompe la subida). `upload_spectrum` solo la invoca cuando no llega `material`;
+    si hay sugerencia, `spectrum.material` se guarda como el `framework_code` sugerido (no "Desconocido");
+    la respuesta incluye `material_suggestion: {code, zeolite_name, confidence}` para que el frontend
+    muestre la sugerencia como tal (con % de confianza), no como un hecho — mismo patrón de transparencia
+    que `cif_unavailable_reason`. 4 tests nuevos en `tests/test_spectrum_auto_classification.py` (137
+    tests totales).
+    **Bug real encontrado y corregido, causa raíz de por qué NUNCA se veía en la práctica**:
+    `cargar-espectro.ts` (frontend) tenía `material = 'Zeolita Y'` hardcodeado como default — el
+    formulario de carga no tiene NINGÚN campo editable para material, así que ese literal se enviaba
+    siempre, jamás vacío, y por tanto `_suggest_family` nunca se ejecutaba (la condición es "material no
+    especificado"). Fix: `material = ''`. Sin este fix el backend funcionaba perfectamente pero era
+    inalcanzable desde la UI real.
+    Frontend: `spectra-backend.service.ts` añade `MaterialSuggestion` y
+    `UploadResponse.data.material_suggestion?`; `cargar-espectro.ts` guarda la sugerencia por ítem de la
+    cola (`UploadQueueItem.materialSuggestion`); `cargar-espectro.html` muestra un badge
+    "🧬 {nombre} ({código}) · {confianza}% confianza" junto al mensaje de éxito de cada archivo, con
+    tooltip explicando que es una sugerencia por similitud y que se puede cambiar desde el visor 3D.
+    Verificado backend con curl end-to-end (`material_suggestion` presente y `spectrum.material` seteado
+    al código sugerido). Verificado que el frontend compila sin errores nuevos en consola tras los
+    cambios (solo warnings preexistentes: plotly CDN, CSP `frame-ancestors` en `<meta>`, `NG0100`, ninguno
+    relacionado). **No verificado con clic real de extremo a extremo en el navegador** — el flujo de login
+    de la UI requiere escribir credenciales en el formulario, acción que el harness bloquea por política
+    de seguridad (entrada de credenciales en campos de login); pendiente que el usuario confirme
+    visualmente el badge en su propia sesión autenticada.
