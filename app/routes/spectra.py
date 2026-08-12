@@ -4,6 +4,7 @@ Rutas para carga y gestión de espectros - CON MANEJO DE ERRORES MEJORADO Y LOGS
 
 import logging
 import json
+import numpy as np
 from fastapi import APIRouter, Depends, File, Form, UploadFile, Query, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -15,6 +16,7 @@ from app.models.user import User
 from app.models.spectrum import Spectrum
 from app.schemas.spectrum import SpectrumResponse, SpectrumDetailResponse
 from app.schemas.common import SuccessResponse, PaginatedResponse
+from app.routes.similarity import dataset_matrix_cache
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +140,47 @@ def get_spectra(
 # Cargar nuevo espectro
 # ========================================
 
+def _suggest_family(wavenumbers: list, absorbance: list) -> Optional[dict]:
+    """Auto-clasificación best-effort: compara el espectro recién subido
+    contra el dataset de referencia (mismo motor que usa /search) y sugiere
+    la familia del mejor match, para que el usuario no tenga que escribir
+    manualmente el código IZA cada vez que sube un espectro sin clasificar.
+
+    Devuelve None si el caché todavía no cargó (arranque reciente del
+    servidor) o si no hay ningún match por encima de un umbral mínimo —
+    nunca bloquea ni falla la carga del espectro, es puramente best-effort.
+
+    IMPORTANTE — es una SUGERENCIA, no una clasificación certera: el dataset
+    es sintético y no discrimina perfectamente entre las 35 familias (ver
+    CLAUDE.md), así que el score de similitud puede ser moderado incluso
+    para el mejor match. Por eso se expone `confidence` en la respuesta y el
+    frontend deja cambiar la familia manualmente desde el selector del
+    visor 3D si la sugerencia no es correcta."""
+    if not dataset_matrix_cache.loaded:
+        return None
+    try:
+        wn = np.array(wavenumbers, dtype=np.float32)
+        ab = np.array(absorbance, dtype=np.float32)
+        if wn.size == 0 or ab.size == 0:
+            return None
+        results = dataset_matrix_cache.search(wn, ab, method="cosine", min_similarity=0.5, top_n=1)
+    except Exception as e:
+        logger.warning(f"⚠️ Auto-clasificación de familia falló (no bloquea la carga): {e}")
+        return None
+
+    if not results:
+        return None
+    best = results[0]
+    code = best.get("framework_code")
+    if not code:
+        return None
+    return {
+        "code": code,
+        "zeolite_name": best.get("zeolite_name"),
+        "confidence": float(best.get("similarity", 0.0)),
+    }
+
+
 @router.post(
     "/upload",
     response_model=SuccessResponse,
@@ -177,14 +220,35 @@ async def upload_spectrum(
         logger.debug(f"✅ Archivo parseado: {len(wavenumber_data.get('wavenumbers', []))} puntos")
 
         # ✅ DEFINIR VALORES POR DEFECTO
-        final_material = material if material and material.strip() else "Desconocido"
+        # Auto-clasificación: si el usuario no escribió un material, en vez
+        # de guardar directamente "Desconocido" se compara el espectro
+        # contra el dataset de referencia (mismo motor que /search) y se
+        # sugiere la familia del mejor match — así el espectro queda listo
+        # para el visor 3D sin que el usuario tenga que elegir manualmente.
+        # Best-effort: si el caché no cargó o no hay match confiable, cae de
+        # vuelta a "Desconocido" exactamente como antes.
+        suggestion = None
+        if material and material.strip():
+            final_material = material
+        else:
+            suggestion = _suggest_family(
+                wavenumber_data.get("wavenumbers", []),
+                wavenumber_data.get("absorbance", []),
+            )
+            final_material = suggestion["code"] if suggestion else "Desconocido"
         final_technique = technique if technique and technique.strip() else "ATR"
         final_hydration = hydration_state if hydration_state and hydration_state.strip() else "As-synthesized"
         final_temperature = temperature if temperature and temperature.strip() else "25°C"
 
         # ✅ LOGS DE LOS VALORES FINALES
         logger.info(f"   ✅ Valores finales a guardar:")
-        logger.info(f"      - material final: '{final_material}'")
+        if suggestion:
+            logger.info(
+                f"      - material auto-sugerido: '{final_material}' "
+                f"({suggestion['zeolite_name']}, confianza {suggestion['confidence']:.2f})"
+            )
+        else:
+            logger.info(f"      - material final: '{final_material}'")
         logger.info(f"      - technique final: '{final_technique}'")
         logger.info(f"      - hydration final: '{final_hydration}'")
         logger.info(f"      - temperature final: '{final_temperature}'")
@@ -234,7 +298,12 @@ async def upload_spectrum(
             success=True,
             message="Espectro cargado exitosamente",
             data={
-                "spectrum": spectrum_detail.model_dump()
+                "spectrum": spectrum_detail.model_dump(),
+                # Presente solo cuando el material se auto-clasificó (el
+                # usuario no escribió nada) — el frontend lo usa para avisar
+                # que es una sugerencia por similitud, no una certeza, y que
+                # se puede cambiar desde el selector del visor 3D.
+                "material_suggestion": suggestion,
             }
         )
 
