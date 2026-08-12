@@ -94,3 +94,40 @@ def test_suggest_family_returns_none_on_empty_spectrum(wn_grid, synthetic_lta_sp
     _load_fake_cache([row])
 
     assert _suggest_family([], []) is None
+
+
+# ---------------------------------------------------------------------------
+# POST /spectra/upload — un formato no soportado debe responder 422 con un
+# mensaje claro (regresión: antes caía en el catch-all genérico y devolvía
+# 500 "Error al cargar espectro", sin ninguna pista de qué estaba mal).
+# ---------------------------------------------------------------------------
+
+import asyncio
+import io
+import pytest
+from fastapi import UploadFile, HTTPException
+
+from app.routes.spectra import upload_spectrum
+
+
+def test_upload_unsupported_format_returns_422_with_clear_message(db_session, test_user):
+    upload_file = UploadFile(filename="datos.xlsx", file=io.BytesIO(b"PK\x03\x04" + bytes(range(50))))
+
+    async def _do_upload():
+        return await upload_spectrum(
+            file=upload_file,
+            filename=None,
+            material=None,
+            technique=None,
+            hydration_state=None,
+            temperature=None,
+            db=db_session,
+            current_user=test_user,
+        )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(_do_upload())
+
+    assert exc_info.value.status_code == 422
+    assert "Excel" in exc_info.value.detail
+    assert "no es compatible" in exc_info.value.detail

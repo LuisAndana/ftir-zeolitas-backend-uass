@@ -102,7 +102,7 @@ def get_zeolites(
         logger.error(f"Error obteniendo zeolitas: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error obteniendo zeolitas"
+            detail="No se pudo cargar el catálogo de zeolitas. Intenta de nuevo en unos segundos."
         )
 
 
@@ -151,7 +151,7 @@ def get_zeolite_by_code(
         logger.error(f"Error obteniendo zeolita: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error obteniendo zeolita"
+            detail="No se pudo cargar esta familia de zeolita. Intenta de nuevo en unos segundos."
         )
 
 
@@ -280,7 +280,7 @@ def get_categories(db: Session = Depends(get_db)):
         logger.error(f"Error obteniendo categorías: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error obteniendo categorías"
+            detail="No se pudieron cargar las categorías. Intenta de nuevo en unos segundos."
         )
 
 
@@ -327,5 +327,5 @@ def get_statistics(db: Session = Depends(get_db)):
         logger.error(f"Error obteniendo estadísticas: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error obteniendo estadísticas"
+            detail="No se pudieron cargar las estadísticas. Intenta de nuevo en unos segundos."
         )

@@ -200,7 +200,7 @@ async def get_summary(current_user: User = Depends(require_admin)):
     if summary is None:
         raise HTTPException(
             status_code=500,
-            detail="Error obteniendo resumen del dataset"
+            detail="No se pudo obtener el resumen del dataset. Intenta de nuevo en unos segundos."
         )
     return summary
 
@@ -252,5 +252,5 @@ async def clear_dataset(current_user: User = Depends(require_admin)):
         logger.error(f"Error limpiando dataset: {e}")
         raise HTTPException(
             status_code=500,
-            detail="Error limpiando dataset"
+            detail="No se pudo limpiar el dataset. Intenta de nuevo en unos segundos."
         )

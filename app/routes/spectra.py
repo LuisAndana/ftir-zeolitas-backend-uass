@@ -7,7 +7,7 @@ import json
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, UploadFile, Query, HTTPException, status
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from typing import Optional
 
 from app.core.database import get_db
@@ -309,12 +309,23 @@ async def upload_spectrum(
 
     except HTTPException:
         raise
+    except ValueError as e:
+        # Formato no soportado o archivo sin datos válidos (parse_spectrum_file)
+        # — es un error del archivo que subió el usuario, no del servidor, así
+        # que se le muestra el motivo real en vez de un 500 genérico.
+        logger.warning(f"⚠️ Archivo rechazado ({file.filename}): {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(e)
+        )
     except Exception as e:
         logger.error(f"❌ Error cargando espectro: {e}", exc_info=True)
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error al cargar espectro"
+            detail="No se pudo cargar el espectro por un error interno del servidor. "
+                   "Intenta de nuevo en unos segundos."
         )
 
 
@@ -414,12 +425,27 @@ def delete_spectrum(
             db.delete(spectrum)
             db.commit()
             logger.info(f"✅ Espectro eliminado: {spectrum.filename}")
+        except IntegrityError as e:
+            # Defensa adicional: la FK de similarity_results ya tiene ON DELETE
+            # CASCADE (migración f20fcc4f3e94), así que esto no debería ocurrir
+            # para ese caso puntual — pero si en el futuro se agrega otra tabla
+            # que referencie spectra.id sin cascada, este mensaje evita que el
+            # usuario reciba un 500 genérico sin ninguna pista.
+            logger.error(f"❌ No se pudo eliminar por una referencia asociada: {e}", exc_info=True)
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="No se puede eliminar este espectro porque todavía tiene datos asociados "
+                       "(por ejemplo, resultados de búsqueda). Intenta de nuevo en unos segundos; "
+                       "si el problema persiste, contáctanos."
+            )
         except SQLAlchemyError as e:
             logger.error(f"❌ Error eliminando de BD: {e}", exc_info=True)
             db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Error eliminando espectro"
+                detail="No se pudo eliminar el espectro por un error interno del servidor. "
+                       "Intenta de nuevo en unos segundos."
             )
 
         return SuccessResponse(
@@ -434,13 +460,38 @@ def delete_spectrum(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error eliminando espectro"
+            detail="No se pudo eliminar el espectro por un error interno del servidor. "
+                   "Intenta de nuevo en unos segundos."
         )
 
 
 # ========================================
 # FUNCIONES AUXILIARES
 # ========================================
+
+# Extensiones que el selector de archivos del frontend permitía elegir mal
+# (herencia de una versión anterior de cargar-espectro.html) pero para las que
+# nunca existió un parser real: antes fallaban en silencio con "no se
+# encontraron datos numéricos válidos" (para .xlsx ni siquiera es cierto — el
+# contenido binario simplemente no es texto legible). Se rechazan explícita y
+# tempranamente con un mensaje que nombra el formato y las alternativas.
+UNSUPPORTED_EXTENSIONS = {
+    'xlsx': 'Excel (.xlsx)',
+    'xls': 'Excel (.xls)',
+    'json': 'JSON',
+    'pdf': 'PDF',
+    'doc': 'Word (.doc)',
+    'docx': 'Word (.docx)',
+    'png': 'imagen (.png)',
+    'jpg': 'imagen (.jpg)',
+    'jpeg': 'imagen (.jpeg)',
+}
+
+SUPPORTED_FORMATS_MESSAGE = (
+    "Formatos aceptados: JCAMP-DX (.jdx, .dx, .jcm), CSV/TSV (.csv, .tsv) "
+    "y texto plano de dos columnas número de onda / absorbancia (.txt, .dpt)."
+)
+
 
 def parse_spectrum_file(content: bytes, filename: str) -> dict:
     """
@@ -451,9 +502,16 @@ def parse_spectrum_file(content: bytes, filename: str) -> dict:
          sniffer de delimitador (csv.Sniffer).
       3. Texto plano de dos columnas separadas por espacios (formato original,
          fallback final — nunca se deja de soportar).
+    Formatos explícitamente NO soportados (ver UNSUPPORTED_EXTENSIONS) se
+    rechazan de inmediato con un mensaje claro en vez de intentar parsearlos.
     Retorna: {"wavenumbers": [...], "absorbance": [...]}
     """
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+    if ext in UNSUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"El formato {UNSUPPORTED_EXTENSIONS[ext]} no es compatible. {SUPPORTED_FORMATS_MESSAGE}"
+        )
 
     try:
         if ext in ('jdx', 'dx', 'jcm'):
