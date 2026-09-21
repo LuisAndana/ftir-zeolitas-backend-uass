@@ -400,3 +400,12 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     clic real en el navegador** (mismo bloqueo de seguridad que el pendiente #17: el harness no permite
     escribir credenciales en el formulario de login) — sí se confirmó que el frontend compila sin errores
     nuevos en consola tras los cambios de HTML/CSS/TS.
+    **Revisión de seguridad (`/security-review`, 2026-08-12)** sobre este mismo diff: sin hallazgos con
+    confianza ≥8 (cascada de FK no permite borrar datos de otro usuario — sigue acotada por
+    `Spectrum.user_id == current_user.id`; `str(e)` en el 422 solo refleja el propio archivo del usuario
+    o texto estático). Un candidato de higiene de código sí se corrigió de todas formas: el
+    `except ValueError` en `upload_spectrum` envolvía toda la función, incluyendo
+    `SpectrumResponse.model_validate(...)` DESPUÉS del `db.commit()` — como `pydantic_core.ValidationError`
+    es subclase de `ValueError` en Pydantic v2, un fallo de validación ahí habría reexpuesto texto interno
+    de Pydantic en el 422 en vez de caer al catch-all genérico. Acotado: el `try/except ValueError` ahora
+    envuelve solo la llamada a `parse_spectrum_file`.

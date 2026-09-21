@@ -215,8 +215,22 @@ async def upload_spectrum(
         content = await file.read()
         logger.debug(f"📄 Archivo leído: {len(content)} bytes")
 
-        # Procesar archivo (parsear datos)
-        wavenumber_data = parse_spectrum_file(content, file.filename or "")
+        # Procesar archivo (parsear datos) — el ValueError se captura AQUÍ
+        # MISMO, junto a la única llamada que puede lanzarlo legítimamente,
+        # en vez de en un except ValueError que envuelva toda la función.
+        # Motivo: en Pydantic v2, pydantic_core.ValidationError es subclase
+        # de ValueError — si el except general capturara también los pasos
+        # posteriores (SpectrumResponse.model_validate tras el commit), un
+        # fallo de validación ahí reexpondría texto interno de Pydantic al
+        # cliente en vez de caer en el catch-all genérico y seguro de abajo.
+        try:
+            wavenumber_data = parse_spectrum_file(content, file.filename or "")
+        except ValueError as e:
+            logger.warning(f"⚠️ Archivo rechazado ({file.filename}): {e}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(e)
+            )
         logger.debug(f"✅ Archivo parseado: {len(wavenumber_data.get('wavenumbers', []))} puntos")
 
         # ✅ DEFINIR VALORES POR DEFECTO
@@ -309,16 +323,6 @@ async def upload_spectrum(
 
     except HTTPException:
         raise
-    except ValueError as e:
-        # Formato no soportado o archivo sin datos válidos (parse_spectrum_file)
-        # — es un error del archivo que subió el usuario, no del servidor, así
-        # que se le muestra el motivo real en vez de un 500 genérico.
-        logger.warning(f"⚠️ Archivo rechazado ({file.filename}): {e}")
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e)
-        )
     except Exception as e:
         logger.error(f"❌ Error cargando espectro: {e}", exc_info=True)
         db.rollback()
