@@ -96,6 +96,7 @@ from app.routes.zeolites import router as zeolites_router
 from app.routes.similarity import router as similarity_router
 from app.routes.dataset import router as dataset_router
 from app.routes.admin import router as admin_router
+from app.routes.projects import router as projects_router
 
 logger.info("✅ Todos los routers importados")
 
@@ -139,6 +140,12 @@ app.include_router(
     admin_router,
     prefix="/api/admin",
     tags=["administración"]
+)
+
+app.include_router(
+    projects_router,
+    prefix="/api/projects",
+    tags=["proyectos"]
 )
 
 logger.info("✅ Routers registrados:")

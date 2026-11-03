@@ -409,3 +409,26 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     es subclase de `ValueError` en Pydantic v2, un fallo de validación ahí habría reexpuesto texto interno
     de Pydantic en el 422 en vez de caer al catch-all genérico. Acotado: el `try/except ValueError` ahora
     envuelve solo la llamada a `parse_spectrum_file`.
+20. ✅ Hecho (2026-11-02): **módulo Proyectos** (cuaderno de laboratorio personal, opciones A+B acordadas con
+    el usuario: proyectos personales, mismos formatos que "Cargar espectro"). Backend: `app/models/project.py`
+    (`projects`, `project_files`, `project_file_versions`, `project_activity`; migración `a91c3d5e7b02`,
+    aplicada), `app/routes/projects.py` (`/api/projects`). Reglas de diseño: todo filtrado por dueño y lo ajeno
+    responde 404 (no 403); los datos NUNCA se sobrescriben — cada edición (nota, reemplazo, recorte de rango,
+    restauración) crea una versión nueva con SHA-256 y `change_reason` OBLIGATORIO (≥3 caracteres); la bitácora
+    (`project_activity`) solo se agrega y conserva `file_name` aunque el archivo se borre. Archivos = espectros
+    (se parsean con `parse_spectrum_file`, así que los formatos son exactamente los de la carga normal;
+    límite 5 MB, 100 000 puntos, 200 archivos/proyecto) y notas de texto (200 000 caracteres). Nombres
+    se reducen al nombre base (sin rutas). Contenido en LONGTEXT (no en disco → sin path traversal).
+    "Duplicar" copia la última versión de cada archivo a un proyecto nuevo (`derived_from_id`) para reutilizar
+    en investigaciones futuras. **Biblioteca de referencia verificada**: un espectro del proyecto marcado
+    `is_reference` con `family_code` (confirmado por el investigador, p. ej. con DRX) entra como candidato en
+    `/api/similarity/search` (`source: "project_reference"`, `spectrum_id: null`, trae `project_id`/`file_id`),
+    solo para su dueño — es el primer paso real hacia el pendiente #18 (espectros reales como referencia).
+    18 tests en `tests/test_projects.py` (163 en total). Frontend (`ftir-zeolitas-uas`, sin commitear):
+    `core/services/projects.service.ts`, `modules/proyectos/` (lista, detalle con arrastrar y soltar +
+    bitácora, archivo con gráfica Chart.js, versiones, recorte, reemplazo, referencia), rutas
+    `/dashboard/proyectos[/:id[/archivo/:fid]]` y entrada "Proyectos" en el menú. Verificado: API de
+    punta a punta con curl contra servidor real (crear, subir, recortar, restaurar, 404 de otro usuario,
+    rechazo de .xlsx, borrado en cascada) y Angular compila sin errores. **No verificado con clic real en el
+    navegador** (mismo bloqueo de login que #17). En Búsqueda, los resultados `project_reference` se etiquetan
+    "Referencia verificada" y su botón Ver queda deshabilitado (no tienen `spectrum_id`).

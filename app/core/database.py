@@ -118,6 +118,7 @@ def init_db():
         from app.models.zeolite_family import ZeoliteFamily
         from app.models.similarity_result import SimilarityResult
         from app.models.session_token import SessionToken
+        from app.models.project import Project, ProjectFile, ProjectFileVersion, ProjectActivity
 
         # Crear todas las tablas definidas
         Base.metadata.create_all(bind=engine)

@@ -27,6 +27,7 @@ from app.models.user import User  # noqa: E402, F401
 from app.models.spectrum import Spectrum  # noqa: E402, F401
 from app.models.zeolite_family import ZeoliteFamily  # noqa: E402, F401
 from app.models.similarity_result import SimilarityResult  # noqa: E402, F401
+from app.models.project import Project, ProjectFile, ProjectFileVersion, ProjectActivity  # noqa: E402, F401
 from app.models.session_token import SessionToken  # noqa: E402, F401
 
 target_metadata = Base.metadata

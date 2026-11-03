@@ -27,6 +27,7 @@ from typing import Dict, List, Tuple, Optional
 from app.core.database import get_db
 from app.core.security import get_current_user
 from app.models.spectrum import Spectrum
+from app.models.project import Project, ProjectFile, ProjectFileVersion
 from app.models.user import User
 from app.routes.admin import require_admin
 from app.schemas.similarity import SimilaritySearchRequest
@@ -691,6 +692,58 @@ def search_similarity(
                         "source": "user_database",
                         "rank": 0
                     })
+
+        # ── Biblioteca de referencia verificada (Proyectos): archivos que el
+        # investigador marcó como referencia con su familia confirmada. Mismo
+        # pipeline y misma escala que el resto; solo los del propio usuario. ──
+        if query_processed is not None:
+            try:
+                refs = (
+                    db.query(ProjectFile, ProjectFileVersion)
+                    .join(Project, Project.id == ProjectFile.project_id)
+                    .join(ProjectFileVersion, (ProjectFileVersion.file_id == ProjectFile.id)
+                          & (ProjectFileVersion.version == ProjectFile.current_version))
+                    .filter(Project.user_id == current_user.id,
+                            ProjectFile.is_reference.is_(True),
+                            ProjectFile.kind == "spectrum")
+                    .all()
+                )
+                ref_vectors, ref_files = [], []
+                for pfile, pver in refs:
+                    if family_filter and pfile.family_code != family_filter:
+                        continue
+                    r_raw = json.loads(pver.content)
+                    r_vec = interpolate_and_preprocess(
+                        np.array(r_raw["wavenumbers"], dtype=np.float64),
+                        np.array(r_raw["absorbance"], dtype=np.float64), FIXED_GRID)
+                    if r_vec is not None:
+                        ref_vectors.append(r_vec)
+                        ref_files.append(pfile)
+                if ref_vectors:
+                    ref_sims = weighted_matrix_similarity(
+                        query_processed, np.array(ref_vectors, dtype=np.float32),
+                        safe_method, struct_mask=STRUCT_MASK)
+                    q_peaks_ref = detect_peaks_vectorized(FIXED_GRID, query_processed, threshold=0.05)
+                    for pfile, vec, sim in zip(ref_files, ref_vectors, ref_sims):
+                        pm = match_peaks_vectorized(
+                            q_peaks_ref, detect_peaks_vectorized(FIXED_GRID, vec, threshold=0.05), tolerance)
+                        results.append({
+                            "spectrum_id": None,
+                            "filename": pfile.name,
+                            "family": pfile.family_code,
+                            "framework_code": pfile.family_code,
+                            "global_score": float(sim),
+                            "window_scores": compute_window_scores(
+                                FIXED_GRID, query_processed, vec, method=safe_method)["window_scores"],
+                            "matching_peaks": pm["matched_count"],
+                            "total_peaks": pm["total"],
+                            "source": "project_reference",
+                            "project_id": pfile.project_id,
+                            "file_id": pfile.id,
+                            "rank": 0
+                        })
+            except Exception as e:
+                logger.warning(f"⚠️ No se pudo usar la biblioteca de referencia: {e}")
 
         logger.info(f"⚡ Iniciando búsqueda en dataset...")
 
