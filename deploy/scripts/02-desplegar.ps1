@@ -37,6 +37,6 @@ Copy-ToServer @((Join-Path $tmp "app.tgz"), (Join-Path $tmp "web.tgz"))
 Send-ScriptRemoto "desplegar.sh"
 
 Write-Host "4/4 Desplegando en el servidor ..." -ForegroundColor Cyan
-Invoke-Ssh "bash $RutaRemota/desplegar.sh" -Interactivo
+Invoke-Ssh "bash $RutaRemota/desplegar.sh"
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nPublicado: https://$Dominio" -ForegroundColor Green

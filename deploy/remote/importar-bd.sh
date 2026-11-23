@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Se ejecuta EN EL SERVIDOR (lo lanza 01-migrar-bd.ps1). Importa /opt/ftir/backups/dump.sql.gz.
+# Se ejecuta EN EL SERVIDOR (lo lanza 01-migrar-bd.ps1). Importa ~/ftir/backups/dump.sql.gz en ftir-db.
 set -euo pipefail
-cd /opt/ftir
+cd "$HOME/ftir"
 set -a; . ./.env; set +a
 export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"   # llega al contenedor sin aparecer en la lista de procesos
-DC="sudo --preserve-env=MYSQL_PWD docker compose -f docker-compose.prod.yml"
+DC="docker compose -f docker-compose.prod.yml"
 
 echo "==> Levantando solo la base de datos"
-$DC up -d db
+$DC up -d ftir-db
 for i in $(seq 1 40); do
-  $DC exec -T -e MYSQL_PWD db mysqladmin ping -h localhost -uroot --silent >/dev/null 2>&1 && break
+  $DC exec -T -e MYSQL_PWD ftir-db mysqladmin ping -h localhost -uroot --silent >/dev/null 2>&1 && break
   sleep 3
 done
 
 echo "==> Importando (puede tardar varios minutos)"
-gunzip -c backups/dump.sql.gz | $DC exec -T -e MYSQL_PWD db mysql -uroot ftir_zeolitas
+gunzip -c backups/dump.sql.gz | $DC exec -T -e MYSQL_PWD ftir-db mysql -uroot ftir_zeolitas
 
-echo "==> Verificación"
-$DC exec -T -e MYSQL_PWD db mysql -uroot ftir_zeolitas -e \
+echo "==> Verificacion"
+$DC exec -T -e MYSQL_PWD ftir-db mysql -uroot ftir_zeolitas -e \
   "SELECT 'users' t, COUNT(*) n FROM users UNION ALL SELECT 'spectra', COUNT(*) FROM spectra UNION ALL SELECT 'ftir_spectra', COUNT(*) FROM ftir_spectra UNION ALL SELECT 'zeolite_families', COUNT(*) FROM zeolite_families;"
-echo "Importación terminada."
+echo "Importacion terminada."

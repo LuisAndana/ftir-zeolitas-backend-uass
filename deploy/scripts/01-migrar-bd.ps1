@@ -39,7 +39,7 @@ try {
     Send-ScriptRemoto "importar-bd.sh"
 
     Write-Host "4/4 Importando en el servidor ..." -ForegroundColor Cyan
-    Invoke-Ssh "bash $RutaRemota/importar-bd.sh" -Interactivo
+    Invoke-Ssh "bash $RutaRemota/importar-bd.sh"
 }
 finally {
     Remove-Item $cnf, $sql, $gz -Force -ErrorAction SilentlyContinue

@@ -2,13 +2,14 @@
 $ErrorActionPreference = "Stop"
 $RaizDeploy  = Split-Path -Parent $PSScriptRoot
 $RaizBackend = Split-Path -Parent $RaizDeploy
-$RutaRemota  = "/opt/ftir"
+$RutaRemota  = $null   # se calcula tras leer la configuracion: /home/<usuario>/ftir
 
 $ArchivoConfig = Join-Path $PSScriptRoot "deploy.config.ps1"
 if (-not (Test-Path $ArchivoConfig)) {
     throw "Falta deploy\scripts\deploy.config.ps1. Copia deploy.config.example.ps1 con ese nombre y ajusta los valores."
 }
 . $ArchivoConfig
+$RutaRemota = "/home/" + $Servidor.Split("@")[0] + "/ftir"
 
 foreach ($herramienta in "ssh", "scp", "tar", "git") {
     if (-not (Get-Command $herramienta -ErrorAction SilentlyContinue)) { throw "No se encontro '$herramienta' en el PATH." }
@@ -37,7 +38,7 @@ function Copy-FromServer([string]$Remoto, [string]$Local) {
 function Send-ConfigDocker {
     Copy-ToServer @(
         (Join-Path $RaizDeploy "docker-compose.prod.yml"),
-        (Join-Path $RaizDeploy "Caddyfile")
+        (Join-Path $RaizDeploy "nginx.conf")
     )
 }
 

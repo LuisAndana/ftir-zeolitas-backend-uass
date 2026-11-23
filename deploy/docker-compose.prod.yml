@@ -1,62 +1,86 @@
-# Producción: MySQL + backend FastAPI + Caddy (HTTPS automático con Let's Encrypt).
-# Solo Caddy publica puertos (80/443); MySQL y el backend quedan en la red interna.
+# Produccion en el VPS compartido: MySQL + API + web (nginx). No publica puertos: el HTTPS lo da el proxy
+# del servidor (/srv/proxy), al que este proyecto se une por la red `proxy` con las etiquetas de ftir-web.
+# Despues de `docker compose up -d` hay que correr `/srv/proxy/publicar ftir` (lo hace desplegar.sh).
+# Reglas del proxy (nombres que empiezan con el del proyecto, base solo en la red interna): /srv/proxy/LEEME.md
+name: ftir
+
 services:
-  db:
+  ftir-db:
     image: mysql:9.4
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?falta MYSQL_ROOT_PASSWORD en .env}
       MYSQL_DATABASE: ftir_zeolitas
-      MYSQL_USER: ${DB_USER}
-      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_USER: ${DB_USER:?falta DB_USER en .env}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD en .env}
     volumes:
-      - db_data:/var/lib/mysql
+      - datos_mysql:/var/lib/mysql
     healthcheck:
       test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h localhost -uroot --silent"]
       interval: 10s
       timeout: 5s
       retries: 12
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    networks: [interna]   # la base nunca va en la red proxy
 
-  backend:
+  ftir-api:
     build: ./app
     restart: unless-stopped
-    env_file: .env
+    depends_on:
+      ftir-db:
+        condition: service_healthy
     environment:
-      DB_HOST: db
+      DB_HOST: ftir-db
       DB_PORT: "3306"
       DB_NAME: ftir_zeolitas
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      SECRET_KEY: ${SECRET_KEY:?falta SECRET_KEY en .env}
       ENVIRONMENT: production
       DEBUG: "false"
-    depends_on:
-      db:
-        condition: service_healthy
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?falta ALLOWED_ORIGINS en .env}
+      FRONTEND_URL: ${FRONTEND_URL:?falta FRONTEND_URL en .env}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      SMTP_SERVER: ${SMTP_SERVER:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_EMAIL: ${SMTP_EMAIL:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-FTIR Zeolitas UAS}
     volumes:
       - ./data/cache:/app/cache
       - ./data/uploads:/app/uploads
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 90s
+    mem_limit: 1536m
+    security_opt: ["no-new-privileges:true"]
+    networks: [interna]   # solo ftir-web (nginx) le habla; no esta en la red proxy
 
-  caddy:
-    image: caddy:2
+  ftir-web:
+    image: nginx:1.27-alpine
     restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      DOMAIN: ${DOMAIN}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./web:/srv:ro
-      - caddy_data:/data
-      - caddy_config:/config
+    labels:
+      proxy.dominios: ${DOMAIN:?falta DOMAIN en .env}
+      proxy.puerto: "80"
     depends_on:
-      - backend
+      - ftir-api
+    volumes:
+      - ./web:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    mem_limit: 64m
+    security_opt: ["no-new-privileges:true"]
+    networks: [interna, proxy]
+
+networks:
+  interna: {}
+  # La red del proxy del servidor: ya existe, aqui solo nos unimos a ella.
+  proxy:
+    external: true
 
 volumes:
-  db_data:
-  caddy_data:
-  caddy_config:
+  datos_mysql: {}

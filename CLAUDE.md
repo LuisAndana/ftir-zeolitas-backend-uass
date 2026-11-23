@@ -447,4 +447,13 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     scripts usan `sudo docker`; `MYSQL_PWD` viaja por entorno (no `-p` en argumentos); en produccion CORS solo
     admite `ALLOWED_ORIGINS` y se niega a arrancar si esta vacio. OJO: la variable NO puede llamarse
     `CORS_ORIGINS` (coincide con el campo `cors_origins` y pydantic-settings intenta parsearla como JSON).
+    **Actualizacion 2026-11-22 — el VPS (193.43.134.86, Ubuntu 24.04, usuario `andana`, ya en el grupo `docker`)
+    es COMPARTIDO**: tiene un proxy Caddy en `/srv/proxy` (unico dueno de 80/443; guia `/srv/proxy/LEEME.md`) y
+    otros proyectos (gym = "Heros", kbnutriologa, sopesmagui). Por eso `deploy/` ya NO trae Caddy propio ni toca
+    firewall/puertos: el compose (`name: ftir`; servicios `ftir-db`/`ftir-api`/`ftir-web`) se une a la red
+    externa `proxy` con las etiquetas `proxy.dominios`/`proxy.puerto` y se publica con
+    `/srv/proxy/publicar ftir`. `ftir-web` es nginx (Angular + reenvio de `/api/`). Vive en `/home/andana/ftir`.
+    Dominio previsto: `zeolitas.forasoft.cloud` (hay que crear su registro A en el DNS). No hay NADA ejecutado
+    todavia en el servidor salvo lecturas. Reglas a respetar: nombres que empiezan con `ftir`, base solo en
+    la red interna, nunca `down -v` en `/srv/proxy`, no editar `/srv/proxy/caddy/sitios/`.
 

@@ -1,41 +1,16 @@
 #!/usr/bin/env bash
-# Se ejecuta EN EL SERVIDOR (lo lanza 00-preparar-servidor.ps1). Es repetible.
+# Se ejecuta EN EL SERVIDOR (lo lanza 00-preparar-servidor.ps1). Es repetible y NO toca nada ajeno:
+# no instala paquetes, no cambia el firewall ni los puertos (son del proxy compartido).
 set -euo pipefail
 DOMINIO="${1:?falta el dominio}"
-RUTA=/opt/ftir
+RUTA="$HOME/ftir"
 
-echo "==> Docker"
-if ! command -v docker >/dev/null 2>&1; then
-  # Repositorio APT oficial de Docker, con su llave verificada por huella (sin ejecutar scripts descargados).
-  sudo apt-get update -y
-  sudo apt-get install -y ca-certificates curl gnupg
-  sudo install -m 0755 -d /etc/apt/keyrings
-  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-  HUELLA_ESPERADA="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
-  HUELLA=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | awk -F: '/^fpr:/ {print $10; exit}')
-  if [ "$HUELLA" != "$HUELLA_ESPERADA" ]; then
-    echo "La huella de la llave de Docker no coincide ($HUELLA). Abortando por seguridad." >&2
-    sudo rm -f /etc/apt/keyrings/docker.asc
-    exit 1
-  fi
-  sudo chmod a+r /etc/apt/keyrings/docker.asc
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable"     | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-  sudo apt-get update -y
-  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-fi
-# No se agrega al usuario al grupo "docker" (equivale a root): los scripts usan "sudo docker".
-sudo docker compose version >/dev/null
-
-echo "==> Firewall (solo SSH, HTTP y HTTPS)"
-if command -v ufw >/dev/null 2>&1; then
-  sudo ufw allow OpenSSH >/dev/null
-  sudo ufw allow 80/tcp >/dev/null
-  sudo ufw allow 443/tcp >/dev/null
-  sudo ufw --force enable >/dev/null
-fi
+echo "==> Comprobando el servidor"
+docker compose version >/dev/null || { echo "Docker Compose no esta disponible para este usuario" >&2; exit 1; }
+docker network inspect proxy >/dev/null 2>&1 || { echo "No existe la red proxy del proxy compartido" >&2; exit 1; }
+[ -x /srv/proxy/publicar ] || { echo "No se encuentra /srv/proxy/publicar" >&2; exit 1; }
 
 echo "==> Carpetas en $RUTA"
-sudo mkdir -p "$RUTA" && sudo chown "$(id -un):$(id -gn)" "$RUTA"
 mkdir -p "$RUTA"/{app,web,data/cache,data/uploads,backups}
 
 if [ ! -f "$RUTA/.env" ]; then
@@ -57,7 +32,7 @@ SMTP_EMAIL=
 SMTP_PASSWORD=
 SMTP_FROM_NAME=FTIR Zeolitas UAS
 ENV
-  echo "    Edita SMTP_EMAIL / SMTP_PASSWORD con: nano $RUTA/.env"
+  echo "    Para el correo edita SMTP_EMAIL y SMTP_PASSWORD: nano $RUTA/.env"
 else
   echo "==> .env ya existe, no se toca"
 fi
