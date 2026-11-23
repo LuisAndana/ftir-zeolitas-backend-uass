@@ -6,19 +6,22 @@ RUTA=/opt/ftir
 
 echo "==> Docker"
 if ! command -v docker >/dev/null 2>&1; then
-  curl -fsSL https://get.docker.com | sh
+  curl -fsSL https://get.docker.com | sudo sh
 fi
-docker compose version >/dev/null
+sudo docker compose version >/dev/null
+# Permite usar docker sin sudo (aplica en la proxima sesion SSH)
+sudo usermod -aG docker "$USER"
 
 echo "==> Firewall (solo SSH, HTTP y HTTPS)"
 if command -v ufw >/dev/null 2>&1; then
-  ufw allow OpenSSH >/dev/null
-  ufw allow 80/tcp >/dev/null
-  ufw allow 443/tcp >/dev/null
-  ufw --force enable >/dev/null
+  sudo ufw allow OpenSSH >/dev/null
+  sudo ufw allow 80/tcp >/dev/null
+  sudo ufw allow 443/tcp >/dev/null
+  sudo ufw --force enable >/dev/null
 fi
 
 echo "==> Carpetas en $RUTA"
+sudo mkdir -p "$RUTA" && sudo chown "$(id -un):$(id -gn)" "$RUTA"
 mkdir -p "$RUTA"/{app,web,data/cache,data/uploads,backups}
 
 if [ ! -f "$RUTA/.env" ]; then

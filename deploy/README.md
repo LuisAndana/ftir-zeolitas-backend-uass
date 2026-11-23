@@ -17,6 +17,16 @@ sube ya construido. Todo se hace desde PowerShell con los scripts de `deploy\scr
 
 ## Pasos (PowerShell, desde `deploy\scripts`)
 
+Si tu llave SSH tiene passphrase, cargala una vez para no escribirla en cada comando (PowerShell como administrador la primera vez):
+
+```powershell
+Set-Service ssh-agent -StartupType Manual; Start-Service ssh-agent
+ssh-add $env:USERPROFILE\.ssh\id_ed25519
+```
+
+El usuario del VPS puede ser no-root (usa `sudo`; pedira su contrasena en el paso 00).
+
+
 ```powershell
 Copy-Item deploy.config.example.ps1 deploy.config.ps1   # edita servidor, dominio, rutas
 .\00-preparar-servidor.ps1   # una vez: Docker, firewall, /opt/ftir y .env con claves aleatorias
