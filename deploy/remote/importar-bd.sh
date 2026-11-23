@@ -6,6 +6,8 @@ set -a; . ./.env; set +a
 export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"   # llega al contenedor sin aparecer en la lista de procesos
 DC="docker compose -f docker-compose.prod.yml"
 
+chmod 700 backups; chmod 600 backups/dump.sql.gz   # datos de usuarios en un servidor compartido
+
 echo "==> Levantando solo la base de datos"
 $DC up -d ftir-db
 for i in $(seq 1 40); do

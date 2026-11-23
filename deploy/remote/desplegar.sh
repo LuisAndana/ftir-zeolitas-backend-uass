@@ -7,8 +7,9 @@ export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"
 DC="docker compose -f docker-compose.prod.yml"
 
 echo "==> Respaldo previo de la base de datos"
+chmod 700 backups   # datos de usuarios en un servidor compartido
 if $DC ps --status running ftir-db 2>/dev/null | grep -q ftir-db; then
-  $DC exec -T -e MYSQL_PWD ftir-db mysqldump -uroot --single-transaction ftir_zeolitas | gzip > "backups/pre-deploy-$(date +%Y%m%d-%H%M%S).sql.gz"
+  ( umask 077; $DC exec -T -e MYSQL_PWD ftir-db mysqldump -uroot --single-transaction ftir_zeolitas | gzip > "backups/pre-deploy-$(date +%Y%m%d-%H%M%S).sql.gz" )
   ls -1t backups/pre-deploy-*.sql.gz | tail -n +6 | xargs -r rm --   # conserva los 5 ultimos
 fi
 

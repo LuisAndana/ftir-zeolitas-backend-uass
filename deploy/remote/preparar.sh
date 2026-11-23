@@ -12,6 +12,8 @@ docker network inspect proxy >/dev/null 2>&1 || { echo "No existe la red proxy d
 
 echo "==> Carpetas en $RUTA"
 mkdir -p "$RUTA"/{app,web,data/cache,data/uploads,backups}
+# Los respaldos contienen datos de usuarios y el servidor es compartido: solo este usuario puede entrar.
+chmod 700 "$RUTA/backups"
 
 if [ ! -f "$RUTA/.env" ]; then
   echo "==> Creando .env con claves aleatorias (solo existe en el servidor)"
