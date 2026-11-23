@@ -436,10 +436,15 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     `deploy/` (ver `deploy/README.md`): Docker Compose con MySQL 9.4 + backend + Caddy (HTTPS automatico),
     scripts `deploy/scripts/00..04*.ps1` (preparar servidor, migrar BD local con mysqldump -> gzip -> scp ->
     import, desplegar con `git archive` + `ng build`, estado, respaldo). Secretos solo en `/opt/ftir/.env` del
-    servidor (generados al azar, nunca viajan desde el PC). Cambios de codigo: `CORS_ORIGINS` por variable de
+    servidor (generados al azar, nunca viajan desde el PC). Cambios de codigo: `ALLOWED_ORIGINS` por variable de
     entorno y freno en `app/core/config.py` (con `ENVIRONMENT=production` no arranca con `SECRET_KEY` por
     defecto o corta); frontend `environment.prod.ts` -> `apiUrl: '/api'` (repo del frontend, sin commitear).
     El proyecto gym-app-heros (ATDLRUT) se desplego en Render+Neon, no en Hostinger: no hay precedente a copiar.
     Pendiente: dominio, IP/usuario SSH del VPS y rellenar `deploy.config.ps1`. Probado localmente: sintaxis de
     los .ps1, `git archive` sin `.env`, `mysqldump` real (443 MB, 15 tablas); NO probado contra un servidor.
+    Revision de seguridad del despliegue: Docker se instala por el repo APT oficial con la huella de su llave
+    verificada (si no coincide, aborta); el usuario NO se agrega al grupo `docker` (equivale a root), los
+    scripts usan `sudo docker`; `MYSQL_PWD` viaja por entorno (no `-p` en argumentos); en produccion CORS solo
+    admite `ALLOWED_ORIGINS` y se niega a arrancar si esta vacio. OJO: la variable NO puede llamarse
+    `CORS_ORIGINS` (coincide con el campo `cors_origins` y pydantic-settings intenta parsearla como JSON).
 

@@ -53,14 +53,17 @@ class Settings(BaseSettings):
     # ========================================
     # CORS
     # ========================================
-    # En producción: CORS_ORIGINS="https://tu-dominio.com,https://www.tu-dominio.com"
+    # En producción: ALLOWED_ORIGINS="https://tu-dominio.com,https://www.tu-dominio.com"
     # (se suman a los de desarrollo local).
-    cors_origins: List[str] = [
-        "http://localhost:4200",
-        "http://localhost:3000",
-        "http://127.0.0.1:4200",
-        "http://127.0.0.1:3000"
-    ] + [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+    # En producción NO se incluyen los orígenes localhost (solo los de ALLOWED_ORIGINS).
+    cors_origins: List[str] = (
+        [] if os.getenv("ENVIRONMENT", "development").lower() == "production" else [
+            "http://localhost:4200",
+            "http://localhost:3000",
+            "http://127.0.0.1:4200",
+            "http://127.0.0.1:3000"
+        ]
+    ) + [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 
     # ========================================
     # ARCHIVOS - UPLOAD
@@ -117,6 +120,9 @@ if settings.environment.lower() == "production" and (
     raise RuntimeError(
         "SECRET_KEY insegura en producción: define una clave aleatoria de 32+ caracteres en el .env del servidor."
     )
+
+if settings.environment.lower() == "production" and not settings.cors_origins:
+    raise RuntimeError("ALLOWED_ORIGINS vacío en producción: define el dominio del sitio (https://tu-dominio.com).")
 
 # Log de configuración al iniciar
 if settings.debug:

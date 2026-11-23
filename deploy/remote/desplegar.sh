@@ -2,12 +2,13 @@
 # Se ejecuta EN EL SERVIDOR (lo lanza 02-desplegar.ps1) con app.tgz y web.tgz ya subidos a /opt/ftir.
 set -euo pipefail
 cd /opt/ftir
-DC="docker compose -f docker-compose.prod.yml"
+DC="sudo --preserve-env=MYSQL_PWD docker compose -f docker-compose.prod.yml"
 
 echo "==> Respaldo previo de la base de datos"
 set -a; . ./.env; set +a
+export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"
 if $DC ps --status running db 2>/dev/null | grep -q db; then
-  $DC exec -T db mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction ftir_zeolitas | gzip > "backups/pre-deploy-$(date +%Y%m%d-%H%M%S).sql.gz"
+  $DC exec -T -e MYSQL_PWD db mysqldump -uroot --single-transaction ftir_zeolitas | gzip > "backups/pre-deploy-$(date +%Y%m%d-%H%M%S).sql.gz"
   ls -1t backups/pre-deploy-*.sql.gz | tail -n +6 | xargs -r rm --   # conserva los 5 últimos
 fi
 
