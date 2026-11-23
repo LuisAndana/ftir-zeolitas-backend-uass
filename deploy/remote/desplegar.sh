@@ -16,7 +16,9 @@ fi
 echo "==> Codigo del backend"
 rm -rf app && mkdir app && tar -xzf app.tgz -C app && rm app.tgz
 echo "==> Frontend"
-rm -rf web && mkdir web && tar -xzf web.tgz -C web && rm web.tgz
+# Se vacia el CONTENIDO de web/ pero no la carpeta: nginx la tiene montada y, si se borra y recrea, el contenedor
+# sigue mirando la carpeta vieja (vacia) y responde 403/500 hasta reiniciarlo.
+mkdir -p web && find web -mindepth 1 -delete && tar -xzf web.tgz -C web && rm web.tgz
 
 echo "==> Construyendo y levantando (solo este proyecto)"
 $DC up -d --build --remove-orphans
