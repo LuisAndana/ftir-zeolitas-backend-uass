@@ -432,3 +432,14 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     rechazo de .xlsx, borrado en cascada) y Angular compila sin errores. **No verificado con clic real en el
     navegador** (mismo bloqueo de login que #17). En Búsqueda, los resultados `project_reference` se etiquetan
     "Referencia verificada" y su botón Ver queda deshabilitado (no tienen `spectrum_id`).
+21. Preparado (2026-11-22), NO ejecutado todavia: **despliegue en VPS de Hostinger** desde PowerShell. Todo en
+    `deploy/` (ver `deploy/README.md`): Docker Compose con MySQL 9.4 + backend + Caddy (HTTPS automatico),
+    scripts `deploy/scripts/00..04*.ps1` (preparar servidor, migrar BD local con mysqldump -> gzip -> scp ->
+    import, desplegar con `git archive` + `ng build`, estado, respaldo). Secretos solo en `/opt/ftir/.env` del
+    servidor (generados al azar, nunca viajan desde el PC). Cambios de codigo: `CORS_ORIGINS` por variable de
+    entorno y freno en `app/core/config.py` (con `ENVIRONMENT=production` no arranca con `SECRET_KEY` por
+    defecto o corta); frontend `environment.prod.ts` -> `apiUrl: '/api'` (repo del frontend, sin commitear).
+    El proyecto gym-app-heros (ATDLRUT) se desplego en Render+Neon, no en Hostinger: no hay precedente a copiar.
+    Pendiente: dominio, IP/usuario SSH del VPS y rellenar `deploy.config.ps1`. Probado localmente: sintaxis de
+    los .ps1, `git archive` sin `.env`, `mysqldump` real (443 MB, 15 tablas); NO probado contra un servidor.
+

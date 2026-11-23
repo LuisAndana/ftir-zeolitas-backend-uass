@@ -63,3 +63,7 @@ htmlcov/
 # ── OS ────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# Despliegue: configuracion local y respaldos
+deploy/scripts/deploy.config.ps1
+deploy/backups-descargados/

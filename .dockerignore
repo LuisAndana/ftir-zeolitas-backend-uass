@@ -1,0 +1,16 @@
+.git
+.claude
+.venv
+.venv_run
+venv
+__pycache__
+*.pyc
+.env
+.env.*
+cache
+uploads
+graphify-out
+server.log
+tests
+deploy
+*.db

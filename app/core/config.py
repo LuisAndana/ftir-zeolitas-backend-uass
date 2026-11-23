@@ -53,12 +53,14 @@ class Settings(BaseSettings):
     # ========================================
     # CORS
     # ========================================
+    # En producción: CORS_ORIGINS="https://tu-dominio.com,https://www.tu-dominio.com"
+    # (se suman a los de desarrollo local).
     cors_origins: List[str] = [
         "http://localhost:4200",
         "http://localhost:3000",
         "http://127.0.0.1:4200",
         "http://127.0.0.1:3000"
-    ]
+    ] + [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
     # ========================================
     # ARCHIVOS - UPLOAD
@@ -106,6 +108,15 @@ def get_settings() -> Settings:
 
 # Crear instancia global
 settings = get_settings()
+
+# Freno de seguridad: en producción no se arranca con la clave JWT por defecto
+# (cualquiera podría firmar tokens válidos) ni con una clave corta.
+if settings.environment.lower() == "production" and (
+    "cambiar_en_produccion" in settings.secret_key or len(settings.secret_key) < 32
+):
+    raise RuntimeError(
+        "SECRET_KEY insegura en producción: define una clave aleatoria de 32+ caracteres en el .env del servidor."
+    )
 
 # Log de configuración al iniciar
 if settings.debug:
