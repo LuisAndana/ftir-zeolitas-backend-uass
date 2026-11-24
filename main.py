@@ -8,7 +8,7 @@ import os
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -36,13 +36,16 @@ logger.info(f"📁 Carpeta de uploads: {settings.upload_folder}")
 # CREAR APLICACIÓN FASTAPI
 # ========================================
 
+_PROD = settings.environment.lower() == "production"
+
 app = FastAPI(
     title=settings.api_title,
     description=settings.api_description,
     version=settings.api_version,
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    # En produccion no se publica el mapa completo de la API (docs, redoc, openapi.json)
+    docs_url=None if _PROD else "/docs",
+    redoc_url=None if _PROD else "/redoc",
+    openapi_url=None if _PROD else "/openapi.json",
 )
 
 # ========================================
@@ -53,10 +56,24 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
+    expose_headers=["Retry-After", "Content-Disposition"],
 )
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Cabeceras defensivas en todas las respuestas de la API (respuestas JSON, nunca se renderizan como pagina)."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path not in ("/docs", "/redoc"):   # la interfaz de Swagger (solo en desarrollo) necesita sus scripts
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+    response.headers.setdefault("Cache-Control", "no-store")   # respuestas con datos de usuario: no cachear
+    if _PROD:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 logger.info(f"✅ CORS configurado para: {settings.cors_origins}")
 

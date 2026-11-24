@@ -13,6 +13,15 @@ class UserRegister(BaseModel):
     email: EmailStr = Field(..., description="Email válido y único")
     password: str = Field(..., min_length=8, max_length=255, description="Contraseña mínimo 8 caracteres")
 
+    @field_validator('password')
+    @classmethod
+    def password_must_be_strong(cls, v):
+        from app.core.security import validate_password_strength
+        problem = validate_password_strength(v)
+        if problem:
+            raise ValueError(problem)
+        return v
+
     @field_validator('name')
     @classmethod
     def name_must_have_space(cls, v):

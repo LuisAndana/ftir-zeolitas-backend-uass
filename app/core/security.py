@@ -63,6 +63,38 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 
+COMMON_PASSWORDS = {
+    "password", "password1", "password123", "12345678", "123456789", "1234567890", "qwertyui", "qwerty123",
+    "iloveyou", "admin123", "administrator", "letmein1", "welcome1", "abc12345", "contrasena", "contraseña1",
+    "contrasena1", "zeolitas", "zeolitas1", "zeolitas123", "ftir1234", "uas12345",
+}
+
+
+def validate_password_strength(password: str) -> Optional[str]:
+    """Devuelve el motivo por el que la contrasena es debil, o None si es aceptable."""
+    if not isinstance(password, str) or len(password) < 8:
+        return "La contraseña debe tener al menos 8 caracteres"
+    if len(password) > 128:
+        return "La contraseña no puede superar 128 caracteres"
+    if password.lower() in COMMON_PASSWORDS:
+        return "Esa contraseña es demasiado común; elige otra"
+    if not any(c.isalpha() for c in password) or not any(c.isdigit() for c in password):
+        return "La contraseña debe combinar letras y números"
+    return None
+
+
+# Hash de relleno: se compara aunque el correo no exista, para que el tiempo de respuesta no delate
+# que cuentas existen (enumeracion por temporizacion).
+_DUMMY_HASH = pwd_context.hash("relleno-para-igualar-tiempos")
+
+
+def burn_password_check(password: str) -> None:
+    try:
+        pwd_context.verify(password, _DUMMY_HASH)
+    except Exception:
+        pass
+
+
 # ========================================
 # GESTOR DE TOKENS JWT
 # ========================================
@@ -83,6 +115,7 @@ class TokenManager:
             str: Token JWT codificado
         """
         to_encode = data.copy()
+        to_encode["type"] = "access"   # un refresh token NO sirve como access token
 
         if expires_delta:
             expire = datetime.now(timezone.utc) + expires_delta
@@ -123,6 +156,7 @@ class TokenManager:
             str: Token JWT codificado
         """
         to_encode = data.copy()
+        to_encode["type"] = "refresh"  # un access token NO sirve para pedir otro (ni para renovarse sin limite)
 
         if expires_delta:
             expire = datetime.now(timezone.utc) + expires_delta
@@ -151,12 +185,13 @@ class TokenManager:
 
 
     @staticmethod
-    def verify_token(token: str) -> Dict:
+    def verify_token(token: str, expected_type: Optional[str] = None) -> Dict:
         """
         Verificar y decodificar token JWT
 
         Args:
             token: Token JWT a verificar
+            expected_type: "access" o "refresh"; si se indica, el token debe llevar exactamente ese tipo
 
         Returns:
             dict: Payload decodificado del token
@@ -170,6 +205,8 @@ class TokenManager:
                 settings.secret_key,
                 algorithms=[settings.algorithm]
             )
+            if expected_type is not None and payload.get("type") != expected_type:
+                raise JWTError("Tipo de token incorrecto")
             return payload
         except JWTError as e:
             logger.error(f"Token inválido: {e}")
@@ -309,7 +346,7 @@ async def get_current_user_v2(
 
     try:
         # Verificar token
-        payload = TokenManager.verify_token(token)
+        payload = TokenManager.verify_token(token, expected_type="access")
         user_id = payload.get("sub")
 
         if user_id is None:

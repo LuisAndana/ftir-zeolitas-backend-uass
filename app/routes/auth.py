@@ -5,7 +5,7 @@ Login, registro, verificación de correo, refresh token
 
 import logging
 import secrets
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 
@@ -18,7 +18,17 @@ from app.core.security import (
     verify_password,
     generate_tokens,
     get_current_user,
-    TokenManager
+    TokenManager,
+    validate_password_strength,
+    burn_password_check,
+)
+from app.core.rate_limit import (
+    rate_limit,
+    client_ip,
+    too_many,
+    login_blocked_for,
+    login_failed,
+    login_succeeded,
 )
 from app.core.email_utils import send_verification_email, send_password_reset_email
 
@@ -36,6 +46,7 @@ router = APIRouter(tags=["autenticación"])
     response_model=SuccessResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Registrar nuevo usuario",
+    dependencies=[Depends(rate_limit("register", 5, 3600))],
 )
 def register(
     user_data: UserRegister,
@@ -103,6 +114,7 @@ def register(
     "/verify-email",
     response_model=SuccessResponse,
     summary="Verificar correo con token",
+    dependencies=[Depends(rate_limit("verify-email", 30, 3600))],
 )
 def verify_email(token: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.verification_token == token).first()
@@ -140,14 +152,25 @@ def verify_email(token: str, db: Session = Depends(get_db)):
     response_model=SuccessResponse,
     summary="Iniciar sesión",
 )
-def login(user_data: UserLogin, db: Session = Depends(get_db)):
+def login(user_data: UserLogin, request: Request, db: Session = Depends(get_db)):
     try:
-        user = db.query(User).filter(
-            User.email == user_data.email.lower()
-        ).first()
+        email = user_data.email.lower()
+        ip = client_ip(request)
+
+        # Fuerza bruta: tras varios fallos seguidos (misma cuenta desde la misma IP) se bloquea un rato
+        blocked = login_blocked_for(email, ip)
+        if blocked:
+            logger.warning(f"🚫 Login bloqueado por intentos fallidos: {email} desde {ip}")
+            raise too_many(blocked, "Demasiados intentos fallidos. Espera unos minutos e inténtalo de nuevo.")
+
+        user = db.query(User).filter(User.email == email).first()
+
+        if not user:
+            burn_password_check(user_data.password)   # mismo tiempo que con un correo existente
 
         if not user or not verify_password(user_data.password, user.password_hash):
-            logger.warning(f"❌ Login fallido: {user_data.email}")
+            login_failed(email, ip)
+            logger.warning(f"❌ Login fallido: {email} desde {ip}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Email o contraseña incorrectos"
@@ -165,6 +188,7 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
                 detail="ACCOUNT_PENDING_APPROVAL"
             )
 
+        login_succeeded(email, ip)
         tokens = generate_tokens(user.id)
 
         logger.info(f"✅ Login exitoso: {user.email}")
@@ -197,6 +221,7 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
     "/refresh",
     response_model=SuccessResponse,
     summary="Refrescar access token",
+    dependencies=[Depends(rate_limit("refresh", 60, 3600))],
 )
 def refresh_access_token(
     refresh_token_data: dict,
@@ -205,13 +230,13 @@ def refresh_access_token(
     try:
         refresh_token = refresh_token_data.get("refresh_token")
 
-        if not refresh_token:
+        if not refresh_token or not isinstance(refresh_token, str):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Refresh token requerido"
             )
 
-        payload = TokenManager.verify_token(refresh_token)
+        payload = TokenManager.verify_token(refresh_token, expected_type="refresh")
         user_id = payload.get("sub")
 
         user = db.query(User).filter(User.id == int(user_id)).first()
@@ -254,13 +279,15 @@ def refresh_access_token(
     "/forgot-password",
     response_model=SuccessResponse,
     summary="Solicitar restablecimiento de contraseña",
+    dependencies=[Depends(rate_limit("forgot-password", 5, 3600))],
 )
 def forgot_password(
     body: dict,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    email = body.get("email", "").strip().lower()
+    email = body.get("email", "")
+    email = email.strip().lower() if isinstance(email, str) else ""
 
     # Buscar usuario sin revelar si existe (previene enumeración de emails)
     user = db.query(User).filter(User.email == email).first()
@@ -288,10 +315,14 @@ def forgot_password(
     "/reset-password",
     response_model=SuccessResponse,
     summary="Restablecer contraseña con token",
+    dependencies=[Depends(rate_limit("reset-password", 10, 3600))],
 )
 def reset_password(body: dict, db: Session = Depends(get_db)):
-    token = body.get("token", "").strip()
+    token = body.get("token", "")
+    token = token.strip() if isinstance(token, str) else ""
     new_password = body.get("new_password", "")
+    if not isinstance(new_password, str):
+        new_password = ""
 
     if not token or not new_password:
         raise HTTPException(
@@ -299,11 +330,9 @@ def reset_password(body: dict, db: Session = Depends(get_db)):
             detail="Token y nueva contraseña son requeridos"
         )
 
-    if len(new_password) < 8:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="La contraseña debe tener al menos 8 caracteres"
-        )
+    problem = validate_password_strength(new_password)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=problem)
 
     user = db.query(User).filter(User.reset_token == token).first()
 

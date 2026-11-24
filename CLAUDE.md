@@ -456,4 +456,15 @@ God nodes (los que más conectan, tocar con cuidado): `User` (34 aristas), `Succ
     Dominio previsto: `zeolitas.forasoft.cloud` (hay que crear su registro A en el DNS). No hay NADA ejecutado
     todavia en el servidor salvo lecturas. Reglas a respetar: nombres que empiezan con `ftir`, base solo en
     la red interna, nunca `down -v` en `/srv/proxy`, no editar `/srv/proxy/caddy/sitios/`.
-
+22. Hecho (2026-11-23): **endurecimiento de ciberseguridad**. `app/core/rate_limit.py` (ventana deslizante en memoria,
+    1 solo worker; si se escala, mover a Redis): bloqueo de login tras 5 fallos por (cuenta, IP) y 20 por IP en 15 min
+    (por par para que nadie bloquee a la victima desde otra IP), limites por IP en register/verify-email/forgot/reset/
+    refresh. JWT con claim `type` (`access`/`refresh`, `verify_token(expected_type=...)`): antes un access token servia
+    para renovarse sin limite y un refresh como access; los tokens viejos sin `type` se rechazan (re-login unico).
+    Contrasena: min 8, letras+numeros, lista de comunes (`validate_password_strength`), tambien en reset. Login iguala
+    tiempos con hash de relleno (anti-enumeracion). `/docs`,`/redoc`,`/openapi.json` apagados con ENVIRONMENT=production.
+    CORS con metodos/cabeceras explicitos; cabeceras de seguridad en toda respuesta de la API. `deploy/nginx.conf`: IP
+    real via X-Forwarded-For (solo desde redes privadas), `limit_req` 10/min en login/register/forgot/reset/verify,
+    20 r/s general, `limit_conn`, timeouts, HSTS, Permissions-Policy. 19 tests en `tests/test_security_hardening.py`
+    (183 en total). Pendiente del usuario: SPF/DKIM/DMARC del dominio de correo (anti-phishing, es DNS), rotar
+    credenciales de P0 #1, y valorar mover los tokens del frontend de localStorage a cookies HttpOnly.
