@@ -22,6 +22,8 @@ mkdir -p web && find web -mindepth 1 -delete && tar -xzf web.tgz -C web && rm we
 
 echo "==> Construyendo y levantando (solo este proyecto)"
 $DC up -d --build --remove-orphans
+# nginx.conf se monta como archivo y se reemplaza en cada subida: reiniciar ftir-web para que lea la version nueva
+$DC restart ftir-web
 
 echo "==> Migraciones de esquema"
 $DC exec -T ftir-api alembic upgrade head
